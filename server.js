@@ -5,11 +5,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Costanti ──
 const SERVER_NAME    = 'newsradar-mcp';
 const SERVER_VERSION = '1.0.0';
 
-// ── Il tuo prompt fisso di elaborazione notizie ──
+// ── Token Notion — letto dalla variabile d'ambiente su Render (mai nel codice!) ──
+const NOTION_TOKEN   = process.env.NOTION_TOKEN || '';
+const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID || '336a3e42e9f180e59794e22a4a7fb751';
+
+// ── Il tuo prompt fisso ──
 const NEWSRADAR_PROMPT = `Ti passo un file con una o più notizie. Ogni notizia ha un titolo, una descrizione e un URL.
 Lavora su un articolo alla volta. Per ognuno segui queste fasi nell'ordine.
 ---
@@ -69,42 +72,132 @@ Niente sezioni con titoli, niente elenchi puntati, niente grassetti a caso: test
 - Confermami il salvataggio con una riga, poi chiedi se procedere con il prossimo articolo`;
 
 // ══════════════════════════════════════════════
-//  MCP PROTOCOL — Streamable HTTP (spec 2025-03-26)
+//  NOTION HELPER
 // ══════════════════════════════════════════════
+async function scriviSuNotion(articoli) {
+  if (!NOTION_TOKEN) throw new Error('NOTION_TOKEN non configurato nelle variabili d\'ambiente di Render.');
 
-// In-memory session store
-const sessions = new Map();
+  const dataOggi = new Date().toLocaleDateString('it-IT', {
+    day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
 
-function makeSessionId() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  // Costruisci i blocchi della pagina Notion
+  const blocchi = [];
+
+  // Banner intestazione
+  blocchi.push({
+    object: 'block', type: 'callout',
+    callout: {
+      rich_text: [{ type: 'text', text: { content: `🚀 Task NewsRadar — ${dataOggi} — ${articoli.length} articol${articoli.length === 1 ? 'o' : 'i'}` } }],
+      icon: { emoji: '📰' },
+      color: 'purple_background'
+    }
+  });
+
+  blocchi.push({
+    object: 'block', type: 'callout',
+    callout: {
+      rich_text: [{ type: 'text', text: { content: 'ISTRUZIONE COWORK: Elabora ogni articolo elencato qui sotto seguendo il tuo prompt. Per ognuno: apri l\'URL con web_fetch, scrivi l\'articolo in italiano e salvalo come .md nella cartella ~/Desktop/newsradar-output' } }],
+      icon: { emoji: '⚡' },
+      color: 'yellow_background'
+    }
+  });
+
+  blocchi.push({ object: 'block', type: 'divider', divider: {} });
+
+  // Un blocco per ogni articolo
+  for (let i = 0; i < articoli.length; i++) {
+    const a   = articoli[i];
+    const num = String(i + 1).padStart(2, '0');
+
+    blocchi.push({
+      object: 'block', type: 'heading_3',
+      heading_3: {
+        rich_text: [{ type: 'text', text: { content: `ARTICOLO ${num} — ${a.titolo}` } }],
+        color: 'purple'
+      }
+    });
+
+    const metaParti = [];
+    if (a.fonte) metaParti.push(`Fonte: ${a.fonte}`);
+    if (a.data)  metaParti.push(`Data: ${a.data}`);
+    if (a.descrizione) metaParti.push(`Descrizione: ${a.descrizione}`);
+
+    if (metaParti.length) {
+      blocchi.push({
+        object: 'block', type: 'paragraph',
+        paragraph: {
+          rich_text: [{ type: 'text', text: { content: metaParti.join(' · ') }, annotations: { color: 'gray' } }]
+        }
+      });
+    }
+
+    blocchi.push({
+      object: 'block', type: 'paragraph',
+      paragraph: {
+        rich_text: [
+          { type: 'text', text: { content: '🔗 URL: ' }, annotations: { bold: true } },
+          { type: 'text', text: { content: a.url, link: { url: a.url } }, annotations: { color: 'blue' } }
+        ]
+      }
+    });
+
+    blocchi.push({ object: 'block', type: 'divider', divider: {} });
+  }
+
+  // Chiama l'API Notion
+  const res = await fetch('https://api.notion.com/v1/pages', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${NOTION_TOKEN}`,
+      'Notion-Version': '2022-06-28',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      parent: { page_id: NOTION_PAGE_ID },
+      properties: {
+        title: {
+          title: [{ text: { content: `📰 NewsRadar Task — ${dataOggi}` } }]
+        }
+      },
+      children: blocchi.slice(0, 100) // Notion max 100 blocchi per chiamata
+    })
+  });
+
+  const data = await res.json();
+  if (!res.ok || data.object === 'error') {
+    throw new Error(data.message || `Notion API error ${res.status}`);
+  }
+
+  return {
+    paginaId:  data.id,
+    paginaUrl: data.url
+  };
 }
 
-// ── Tool definitions ──
+// ══════════════════════════════════════════════
+//  MCP TOOLS
+// ══════════════════════════════════════════════
 const TOOLS = [
   {
     name: 'invia_notizie_a_cowork',
-    description: 'Riceve una lista di articoli selezionati da NewsRadar e costruisce il task completo per Claude Cowork, combinando le notizie con il prompt di elaborazione. Restituisce il prompt pronto da eseguire.',
+    description: 'Riceve articoli da NewsRadar, li scrive su Notion e restituisce l\'URL della pagina pronta per Cowork.',
     inputSchema: {
       type: 'object',
       properties: {
         articoli: {
           type: 'array',
-          description: 'Lista degli articoli selezionati da NewsRadar',
           items: {
             type: 'object',
             properties: {
-              titolo:      { type: 'string', description: 'Titolo dell\'articolo' },
-              descrizione: { type: 'string', description: 'Descrizione / sommario' },
-              url:         { type: 'string', description: 'URL dell\'articolo originale' },
-              fonte:       { type: 'string', description: 'Nome della fonte/testata' },
-              data:        { type: 'string', description: 'Data di pubblicazione (ISO)' }
+              titolo:      { type: 'string' },
+              descrizione: { type: 'string' },
+              url:         { type: 'string' },
+              fonte:       { type: 'string' },
+              data:        { type: 'string' }
             },
             required: ['titolo', 'url']
           }
-        },
-        cartella_output: {
-          type: 'string',
-          description: 'Cartella dove salvare i file .md generati (es. ~/Desktop/articoli). Se omessa usa ~/Desktop/newsradar-output'
         }
       },
       required: ['articoli']
@@ -112,92 +205,40 @@ const TOOLS = [
   },
   {
     name: 'get_prompt_newsradar',
-    description: 'Restituisce il prompt completo di elaborazione notizie di NewsRadar, utile per ispezionarlo o modificarlo.',
-    inputSchema: {
-      type: 'object',
-      properties: {}
-    }
+    description: 'Restituisce il prompt completo di elaborazione notizie.',
+    inputSchema: { type: 'object', properties: {} }
   }
 ];
 
-// ── Tool execution ──
-function executeTool(name, args) {
+async function executeTool(name, args) {
   if (name === 'get_prompt_newsradar') {
-    return {
-      content: [{
-        type: 'text',
-        text: NEWSRADAR_PROMPT
-      }]
-    };
+    return { content: [{ type: 'text', text: NEWSRADAR_PROMPT }] };
   }
 
   if (name === 'invia_notizie_a_cowork') {
-    const { articoli, cartella_output } = args;
-
+    const { articoli } = args;
     if (!articoli || articoli.length === 0) {
-      return {
-        content: [{
-          type: 'text',
-          text: 'Errore: nessun articolo ricevuto. Seleziona almeno un articolo su NewsRadar.'
-        }],
-        isError: true
-      };
+      return { content: [{ type: 'text', text: 'Errore: nessun articolo ricevuto.' }], isError: true };
     }
-
-    const outputDir = cartella_output || '~/Desktop/newsradar-output';
-    const dataOggi  = new Date().toLocaleDateString('it-IT', {
-      day: 'numeric', month: 'long', year: 'numeric'
-    });
-
-    // Costruisci il file notizie
-    const notizieTesto = articoli.map((a, i) => {
-      const num   = String(i + 1).padStart(2, '0');
-      const fonte = a.fonte ? `\n   Fonte: ${a.fonte}` : '';
-      const data  = a.data  ? `\n   Data: ${new Date(a.data).toLocaleDateString('it-IT')}` : '';
-      const desc  = a.descrizione ? `\n   Descrizione: ${a.descrizione}` : '';
-      return `ARTICOLO ${num}\n   Titolo: ${a.titolo}${fonte}${data}${desc}\n   URL: ${a.url}`;
-    }).join('\n\n' + '─'.repeat(50) + '\n\n');
-
-    const taskCompleto = `${NEWSRADAR_PROMPT}
-
-═══════════════════════════════════════════════════════
-NOTIZIE DA ELABORARE — ${dataOggi} (${articoli.length} articol${articoli.length === 1 ? 'o' : 'i'})
-═══════════════════════════════════════════════════════
-
-${notizieTesto}
-
-═══════════════════════════════════════════════════════
-ISTRUZIONI OPERATIVE
-═══════════════════════════════════════════════════════
-- Salva ogni file .md nella cartella: ${outputDir}
-- Crea la cartella se non esiste
-- Nomina i file: 01_parola-chiave.md, 02_parola-chiave.md, ecc.
-- Dopo aver salvato tutti i file, dammi un riepilogo con i nomi dei file creati`;
-
+    const risultato = await scriviSuNotion(articoli);
     return {
       content: [{
         type: 'text',
-        text: `✅ Task NewsRadar pronto! ${articoli.length} articol${articoli.length === 1 ? 'o' : 'i'} da elaborare.\n\nCartella output: ${outputDir}\n\n---\n\n${taskCompleto}`
+        text: `✅ ${articoli.length} articoli scritti su Notion!\nPagina: ${risultato.paginaUrl}\n\nOra vai su Cowork e scrivi: "elabora gli articoli da Notion"`
       }]
     };
   }
 
-  return {
-    content: [{ type: 'text', text: `Tool "${name}" non trovato.` }],
-    isError: true
-  };
+  return { content: [{ type: 'text', text: `Tool "${name}" non trovato.` }], isError: true };
 }
 
-// ── Build MCP response envelope ──
-function mcpResponse(id, result) {
-  return { jsonrpc: '2.0', id, result };
-}
-function mcpError(id, code, message) {
-  return { jsonrpc: '2.0', id, error: { code, message } };
-}
+// ══════════════════════════════════════════════
+//  MCP PROTOCOL
+// ══════════════════════════════════════════════
+function mcpResponse(id, result) { return { jsonrpc: '2.0', id, result }; }
+function mcpError(id, code, message) { return { jsonrpc: '2.0', id, error: { code, message } }; }
 
-// ── Handle a single JSON-RPC message ──
-function handleMessage(msg) {
+async function handleMessage(msg) {
   const { method, params, id } = msg;
 
   if (method === 'initialize') {
@@ -207,27 +248,18 @@ function handleMessage(msg) {
       capabilities: { tools: {} }
     });
   }
-
   if (method === 'notifications/initialized') return null;
-
-  if (method === 'tools/list') {
-    return mcpResponse(id, { tools: TOOLS });
-  }
-
+  if (method === 'tools/list') return mcpResponse(id, { tools: TOOLS });
   if (method === 'tools/call') {
-    const { name, arguments: args } = params;
+    const { name, arguments: toolArgs } = params;
     try {
-      const result = executeTool(name, args || {});
+      const result = await executeTool(name, toolArgs || {});
       return mcpResponse(id, result);
     } catch (e) {
       return mcpError(id, -32603, e.message);
     }
   }
-
-  if (method === 'ping') {
-    return mcpResponse(id, {});
-  }
-
+  if (method === 'ping') return mcpResponse(id, {});
   return mcpError(id, -32601, `Method not found: ${method}`);
 }
 
@@ -238,60 +270,58 @@ function handleMessage(msg) {
 // Health check
 app.get('/', (req, res) => {
   res.json({
-    server:  SERVER_NAME,
-    version: SERVER_VERSION,
-    status:  'ok',
-    tools:   TOOLS.map(t => t.name),
-    mcp_endpoint: '/mcp'
+    server: SERVER_NAME, version: SERVER_VERSION, status: 'ok',
+    notion_configurato: !!NOTION_TOKEN,
+    tools: TOOLS.map(t => t.name)
   });
 });
 
-// MCP Streamable HTTP endpoint (POST + GET on same path)
+// ── Endpoint principale: il sito chiama questo per inviare articoli a Notion ──
+app.post('/notion', async (req, res) => {
+  try {
+    const { articoli } = req.body;
+    if (!articoli || !Array.isArray(articoli) || articoli.length === 0) {
+      return res.status(400).json({ ok: false, error: 'Nessun articolo ricevuto.' });
+    }
+    const risultato = await scriviSuNotion(articoli);
+    res.json({ ok: true, paginaUrl: risultato.paginaUrl, paginaId: risultato.paginaId });
+  } catch (err) {
+    console.error('[/notion]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// MCP endpoint (POST)
 app.post('/mcp', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
-
   const body = req.body;
-
-  // Batch or single
   const messages = Array.isArray(body) ? body : [body];
   const responses = [];
-
   for (const msg of messages) {
-    const r = handleMessage(msg);
+    const r = await handleMessage(msg);
     if (r !== null) responses.push(r);
   }
-
-  if (responses.length === 0) {
-    return res.status(204).end();
-  }
-  if (responses.length === 1 && !Array.isArray(body)) {
-    return res.json(responses[0]);
-  }
+  if (responses.length === 0) return res.status(204).end();
+  if (responses.length === 1 && !Array.isArray(body)) return res.json(responses[0]);
   return res.json(responses);
 });
 
-// SSE endpoint (per compatibilità con vecchi client)
+// MCP SSE (GET)
 app.get('/mcp', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-
-  const sessionId = makeSessionId();
-  sessions.set(sessionId, res);
-
-  res.write(`data: ${JSON.stringify({ type: 'connection', sessionId })}\n\n`);
-
-  req.on('close', () => {
-    sessions.delete(sessionId);
-  });
+  res.write(`data: ${JSON.stringify({ type: 'connection' })}\n\n`);
+  req.on('close', () => {});
 });
 
 // ══════════════════════════════════════════════
-//  START SERVER
+//  START
 // ══════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n🚀 NewsRadar MCP Server avviato su porta ${PORT}`);
-  console.log(`   Endpoint MCP: http://localhost:${PORT}/mcp`);
-  console.log(`   Health check: http://localhost:${PORT}/\n`);
+  console.log(`\n🚀 NewsRadar MCP Server — porta ${PORT}`);
+  console.log(`   /notion  → scrive articoli su Notion`);
+  console.log(`   /mcp     → endpoint MCP per Claude`);
+  console.log(`   Notion token: ${NOTION_TOKEN ? '✅ configurato' : '❌ MANCANTE — aggiungi NOTION_TOKEN su Render'}\n`);
 });
