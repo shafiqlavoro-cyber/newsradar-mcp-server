@@ -6,12 +6,11 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 const SERVER_NAME    = 'newsradar-mcp';
-const SERVER_VERSION = '2.0.0';
-const NOTION_TOKEN   = process.env.NOTION_TOKEN || '';
+const SERVER_VERSION = '2.1.0';
+const NOTION_TOKEN   = process.env.NOTION_TOKEN   || '';
 const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID || '336a3e42e9f180e59794e22a4a7fb751';
 
-// ID del database Notion — viene salvato in memoria dopo la prima creazione
-// Su Render persiste finché il server non viene riavviato
+// ── Se hai l'ID fisso su Render lo usa sempre, altrimenti lo cerca
 let NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || '';
 
 // ══════════════════════════════════════════════
@@ -21,43 +20,69 @@ async function notionRequest(endpoint, method = 'GET', body = null) {
   const options = {
     method,
     headers: {
-      'Authorization': `Bearer ${NOTION_TOKEN}`,
+      'Authorization':  `Bearer ${NOTION_TOKEN}`,
       'Notion-Version': '2022-06-28',
-      'Content-Type': 'application/json'
+      'Content-Type':   'application/json'
     }
   };
   if (body) options.body = JSON.stringify(body);
-  const res = await fetch(`https://api.notion.com/v1${endpoint}`, options);
+  const res  = await fetch(`https://api.notion.com/v1${endpoint}`, options);
   const data = await res.json();
   if (!res.ok || data.object === 'error') throw new Error(data.message || `Notion error ${res.status}`);
   return data;
 }
 
 // ══════════════════════════════════════════════
-//  CREA DATABASE (se non esiste)
+//  TROVA O CREA DATABASE
+//  Priorità:
+//  1. variabile d'ambiente NOTION_DATABASE_ID  (più veloce)
+//  2. cerca tra i database figli della pagina padre
+//  3. crea nuovo database
 // ══════════════════════════════════════════════
 async function getOrCreateDatabase() {
-  // Se abbiamo già l'ID, verifica che esista ancora
+
+  // 1. Abbiamo già l'ID in memoria o da env — verifica che esista
   if (NOTION_DATABASE_ID) {
     try {
       await notionRequest(`/databases/${NOTION_DATABASE_ID}`);
-      return NOTION_DATABASE_ID;
-    } catch {
-      NOTION_DATABASE_ID = ''; // database non trovato, lo ricreiamo
+      return NOTION_DATABASE_ID; // ✅ esiste, usalo
+    } catch (e) {
+      console.warn('[Notion] Database ID non valido, cerco tra i figli...');
+      NOTION_DATABASE_ID = '';
     }
   }
 
-  console.log('[Notion] Creo il database NewsRadar...');
+  // 2. Cerca tra i blocchi figli della pagina padre un database con il nostro titolo
+  try {
+    const children = await notionRequest(`/blocks/${NOTION_PAGE_ID}/children?page_size=100`);
+    for (const block of children.results) {
+      if (block.type === 'child_database') {
+        // Recupera il titolo del database
+        try {
+          const db = await notionRequest(`/databases/${block.id}`);
+          const titolo = db.title?.[0]?.text?.content || '';
+          if (titolo.includes('NewsRadar')) {
+            NOTION_DATABASE_ID = block.id;
+            console.log(`[Notion] Database trovato tra i figli: ${block.id}`);
+            return NOTION_DATABASE_ID;
+          }
+        } catch (e) {
+          // blocco non accessibile, skip
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[Notion] Errore nella ricerca dei figli:', e.message);
+  }
 
+  // 3. Non trovato — crea nuovo
+  console.log('[Notion] Creo il database NewsRadar...');
   const db = await notionRequest('/databases', 'POST', {
     parent: { page_id: NOTION_PAGE_ID },
-    title: [{ type: 'text', text: { content: '📰 NewsRadar — Articoli' } }],
-    icon: { emoji: '📰' },
+    title:  [{ type: 'text', text: { content: '📰 NewsRadar — Articoli' } }],
+    icon:   { emoji: '📰' },
     properties: {
-      // Titolo principale (obbligatorio per ogni database Notion)
-      'Titolo': { title: {} },
-
-      // Status editoriale
+      'Titolo':          { title: {} },
       'Status': {
         select: {
           options: [
@@ -67,29 +92,18 @@ async function getOrCreateDatabase() {
           ]
         }
       },
-
-      // URL dell'articolo originale
-      'URL originale': { url: {} },
-
-      // Fonte / testata
-      'Fonte': { rich_text: {} },
-
-      // Data pubblicazione originale
-      'Data originale': { rich_text: {} },
-
-      // Testo elaborato da Claude (l'articolo riscritto)
+      'URL originale':   { url: {} },
+      'Fonte':           { rich_text: {} },
+      'Data originale':  { rich_text: {} },
       'Testo elaborato': { rich_text: {} },
-
-      // Data di invio dal sito
-      'Inviato il': { date: {} },
-
-      // ID univoco per collegare sito ↔ Notion
-      'Article ID': { rich_text: {} }
+      'Inviato il':      { date: {} },
+      'Article ID':      { rich_text: {} }
     }
   });
 
   NOTION_DATABASE_ID = db.id;
   console.log(`[Notion] Database creato: ${db.id}`);
+  console.log(`[Notion] ⚠️  Salva questo ID su Render come NOTION_DATABASE_ID=${db.id}`);
   return NOTION_DATABASE_ID;
 }
 
@@ -97,16 +111,16 @@ async function getOrCreateDatabase() {
 //  AGGIUNGE ARTICOLI AL DATABASE
 // ══════════════════════════════════════════════
 async function aggiungiArticoliAlDatabase(articoli) {
-  const dbId = await getOrCreateDatabase();
+  const dbId     = await getOrCreateDatabase();
   const risultati = [];
 
   for (const a of articoli) {
     const page = await notionRequest('/pages', 'POST', {
-      parent: { database_id: dbId },
+      parent:     { database_id: dbId },
       properties: {
         'Titolo':          { title:     [{ text: { content: a.titolo || '' } }] },
         'Status':          { select:    { name: 'In attesa' } },
-        'URL originale':   { url:       a.url || null },
+        'URL originale':   { url:       a.url  || null },
         'Fonte':           { rich_text: [{ text: { content: a.fonte || '' } }] },
         'Data originale':  { rich_text: [{ text: { content: a.data  || '' } }] },
         'Testo elaborato': { rich_text: [{ text: { content: '' } }] },
@@ -129,7 +143,7 @@ async function aggiungiArticoliAlDatabase(articoli) {
 }
 
 // ══════════════════════════════════════════════
-//  AGGIORNA STATUS E TESTO (chiamato da Cowork)
+//  AGGIORNA ARTICOLO
 // ══════════════════════════════════════════════
 async function aggiornaArticolo(notionPageId, { status, testoElaborato }) {
   const properties = {};
@@ -139,7 +153,6 @@ async function aggiornaArticolo(notionPageId, { status, testoElaborato }) {
   }
 
   if (testoElaborato) {
-    // Notion limita rich_text a 2000 caratteri per blocco — dividiamo se necessario
     const chunks = [];
     for (let i = 0; i < testoElaborato.length; i += 2000) {
       chunks.push({ text: { content: testoElaborato.slice(i, i + 2000) } });
@@ -152,26 +165,23 @@ async function aggiornaArticolo(notionPageId, { status, testoElaborato }) {
 }
 
 // ══════════════════════════════════════════════
-//  LEGGI ARTICOLI DAL DATABASE (per Cowork)
+//  LEGGI ARTICOLI IN ATTESA
 // ══════════════════════════════════════════════
 async function leggiArticoliInAttesa() {
   const dbId = await getOrCreateDatabase();
 
   const res = await notionRequest(`/databases/${dbId}/query`, 'POST', {
-    filter: {
-      property: 'Status',
-      select: { equals: 'In attesa' }
-    },
-    sorts: [{ property: 'Inviato il', direction: 'descending' }]
+    filter: { property: 'Status', select: { equals: 'In attesa' } },
+    sorts:  [{ property: 'Inviato il', direction: 'descending' }]
   });
 
   return res.results.map(page => ({
     notionPageId: page.id,
-    titolo:       page.properties['Titolo']?.title?.[0]?.text?.content || '',
-    url:          page.properties['URL originale']?.url || '',
-    fonte:        page.properties['Fonte']?.rich_text?.[0]?.text?.content || '',
+    titolo:       page.properties['Titolo']?.title?.[0]?.text?.content     || '',
+    url:          page.properties['URL originale']?.url                    || '',
+    fonte:        page.properties['Fonte']?.rich_text?.[0]?.text?.content  || '',
     data:         page.properties['Data originale']?.rich_text?.[0]?.text?.content || '',
-    articleId:    page.properties['Article ID']?.rich_text?.[0]?.text?.content || ''
+    articleId:    page.properties['Article ID']?.rich_text?.[0]?.text?.content     || ''
   }));
 }
 
@@ -181,7 +191,7 @@ async function leggiArticoliInAttesa() {
 const TOOLS = [
   {
     name: 'invia_articoli',
-    description: 'Aggiunge articoli selezionati da NewsRadar al database Notion con status "In attesa".',
+    description: 'Aggiunge articoli da NewsRadar al database Notion con status "In attesa".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -206,18 +216,18 @@ const TOOLS = [
   },
   {
     name: 'leggi_articoli_in_attesa',
-    description: 'Restituisce tutti gli articoli con status "In attesa" dal database Notion, pronti per essere elaborati da Cowork.',
+    description: 'Restituisce tutti gli articoli con status "In attesa" dal database Notion.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'aggiorna_articolo',
-    description: 'Aggiorna un articolo nel database Notion con il testo elaborato e cambia lo status a "Elaborato".',
+    description: 'Aggiorna un articolo nel database Notion con testo elaborato e status.',
     inputSchema: {
       type: 'object',
       properties: {
-        notionPageId:    { type: 'string', description: 'ID della pagina Notion dell\'articolo' },
-        testoElaborato:  { type: 'string', description: 'Testo dell\'articolo riscritto da Claude' },
-        status:          { type: 'string', enum: ['In attesa', 'Elaborato', 'Pubblicato'], description: 'Nuovo status dell\'articolo' }
+        notionPageId:   { type: 'string' },
+        testoElaborato: { type: 'string' },
+        status:         { type: 'string', enum: ['In attesa', 'Elaborato', 'Pubblicato'] }
       },
       required: ['notionPageId']
     }
@@ -231,15 +241,15 @@ async function executeTool(name, args) {
       return { content: [{ type: 'text', text: 'Errore: nessun articolo.' }], isError: true };
     const risultato = await aggiungiArticoliAlDatabase(articoli);
     const lista = risultato.risultati.map(r => `- ${r.titolo}`).join('\n');
-    return { content: [{ type: 'text', text: `✅ ${articoli.length} articoli aggiunti al database.\n\n${lista}` }] };
+    return { content: [{ type: 'text', text: `✅ ${articoli.length} articoli aggiunti.\n\n${lista}` }] };
   }
 
   if (name === 'leggi_articoli_in_attesa') {
     const articoli = await leggiArticoliInAttesa();
     if (articoli.length === 0)
-      return { content: [{ type: 'text', text: 'Nessun articolo in attesa di elaborazione.' }] };
+      return { content: [{ type: 'text', text: 'Nessun articolo in attesa.' }] };
     const lista = articoli.map((a, i) =>
-      `${i + 1}. **${a.titolo}**\n   ID Notion: ${a.notionPageId}\n   URL: ${a.url}\n   Fonte: ${a.fonte}`
+      `${i + 1}. **${a.titolo}**\n   ID: ${a.notionPageId}\n   URL: ${a.url}`
     ).join('\n\n');
     return { content: [{ type: 'text', text: `📋 ${articoli.length} articoli in attesa:\n\n${lista}` }] };
   }
@@ -258,17 +268,17 @@ async function executeTool(name, args) {
 // ══════════════════════════════════════════════
 //  MCP PROTOCOL
 // ══════════════════════════════════════════════
-function mcpResponse(id, result) { return { jsonrpc: '2.0', id, result }; }
-function mcpError(id, code, message) { return { jsonrpc: '2.0', id, error: { code, message } }; }
+function mcpResponse(id, result)        { return { jsonrpc: '2.0', id, result }; }
+function mcpError(id, code, message)    { return { jsonrpc: '2.0', id, error: { code, message } }; }
 
 async function handleMessage(msg) {
   const { method, params, id } = msg;
-  if (method === 'initialize') return mcpResponse(id, { protocolVersion: '2025-03-26', serverInfo: { name: SERVER_NAME, version: SERVER_VERSION }, capabilities: { tools: {} } });
+  if (method === 'initialize')               return mcpResponse(id, { protocolVersion: '2025-03-26', serverInfo: { name: SERVER_NAME, version: SERVER_VERSION }, capabilities: { tools: {} } });
   if (method === 'notifications/initialized') return null;
-  if (method === 'tools/list') return mcpResponse(id, { tools: TOOLS });
+  if (method === 'tools/list')               return mcpResponse(id, { tools: TOOLS });
   if (method === 'tools/call') {
     const { name, arguments: toolArgs } = params;
-    try { return mcpResponse(id, await executeTool(name, toolArgs || {})); }
+    try   { return mcpResponse(id, await executeTool(name, toolArgs || {})); }
     catch (e) { return mcpError(id, -32603, e.message); }
   }
   if (method === 'ping') return mcpResponse(id, {});
@@ -279,11 +289,14 @@ async function handleMessage(msg) {
 //  HTTP ROUTES
 // ══════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  server: SERVER_NAME, version: SERVER_VERSION, status: 'ok',
-  notion: !!NOTION_TOKEN, database: NOTION_DATABASE_ID || 'verrà creato al primo invio'
+  server:   SERVER_NAME,
+  version:  SERVER_VERSION,
+  status:   'ok',
+  notion:   !!NOTION_TOKEN,
+  database: NOTION_DATABASE_ID || 'verrà cercato/creato al primo invio'
 }));
 
-// Il sito invia articoli → li aggiunge al database
+// Sito → aggiunge articoli al database
 app.post('/notion', async (req, res) => {
   try {
     const { articoli } = req.body;
@@ -297,7 +310,7 @@ app.post('/notion', async (req, res) => {
   }
 });
 
-// Il sito aggiorna lo status di un articolo (es. "Pubblicato")
+// Sito → aggiorna status articolo
 app.patch('/notion/:pageId', async (req, res) => {
   try {
     const { pageId } = req.params;
@@ -310,18 +323,18 @@ app.patch('/notion/:pageId', async (req, res) => {
   }
 });
 
-// Leggi articoli per status (usato dal sito per aggiornare i badge)
+// Sito → legge status singolo articolo
 app.get('/notion/status/:articleId', async (req, res) => {
   try {
-    const dbId = await getOrCreateDatabase();
+    const dbId      = await getOrCreateDatabase();
     const { articleId } = req.params;
-    const result = await notionRequest(`/databases/${dbId}/query`, 'POST', {
+    const result    = await notionRequest(`/databases/${dbId}/query`, 'POST', {
       filter: { property: 'Article ID', rich_text: { equals: articleId } }
     });
     if (result.results.length === 0) return res.json({ ok: true, status: null });
     const page = result.results[0];
     res.json({
-      ok: true,
+      ok:          true,
       status:      page.properties['Status']?.select?.name || null,
       notionPageId: page.id,
       notionUrl:    page.url
@@ -331,22 +344,25 @@ app.get('/notion/status/:articleId', async (req, res) => {
   }
 });
 
-// MCP endpoint POST
+// MCP POST
 app.post('/mcp', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
-  const messages = Array.isArray(req.body) ? req.body : [req.body];
+  const messages  = Array.isArray(req.body) ? req.body : [req.body];
   const responses = [];
-  for (const msg of messages) { const r = await handleMessage(msg); if (r !== null) responses.push(r); }
-  if (responses.length === 0) return res.status(204).end();
+  for (const msg of messages) {
+    const r = await handleMessage(msg);
+    if (r !== null) responses.push(r);
+  }
+  if (responses.length === 0)                          return res.status(204).end();
   if (responses.length === 1 && !Array.isArray(req.body)) return res.json(responses[0]);
   return res.json(responses);
 });
 
-// MCP SSE GET
+// MCP SSE
 app.get('/mcp', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Connection',    'keep-alive');
   res.write(`data: ${JSON.stringify({ type: 'connection' })}\n\n`);
   req.on('close', () => {});
 });
@@ -354,6 +370,6 @@ app.get('/mcp', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n🚀 NewsRadar MCP Server v${SERVER_VERSION} — porta ${PORT}`);
-  console.log(`   Notion token:    ${NOTION_TOKEN    ? '✅' : '❌ MANCANTE'}`);
-  console.log(`   Database ID:     ${NOTION_DATABASE_ID || 'verrà creato al primo invio'}\n`);
+  console.log(`   Notion token:    ${NOTION_TOKEN      ? '✅' : '❌ MANCANTE'}`);
+  console.log(`   Database ID:     ${NOTION_DATABASE_ID || 'cercato automaticamente alla prima richiesta'}\n`);
 });
