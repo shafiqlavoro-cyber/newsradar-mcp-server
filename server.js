@@ -1,17 +1,97 @@
 import express from 'express';
 import cors from 'cors';
+import { Readability } from '@mozilla/readability';
+import { JSDOM } from 'jsdom';
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 const SERVER_NAME    = 'newsradar-mcp';
-const SERVER_VERSION = '2.1.0';
+const SERVER_VERSION = '2.2.0';
 const NOTION_TOKEN   = process.env.NOTION_TOKEN   || '';
 const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID || '336a3e42e9f180e59794e22a4a7fb751';
+let   NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || '';
 
-// ── Se hai l'ID fisso su Render lo usa sempre, altrimenti lo cerca
-let NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || '';
+// ══════════════════════════════════════════════
+//  ESTRAZIONE TESTO ARTICOLO
+//  Usa @mozilla/readability — stessa tecnologia
+//  della modalità lettura di Firefox.
+//  Risultato: solo testo pulito, zero HTML/ads/menu
+// ══════════════════════════════════════════════
+
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+  'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+];
+
+async function estraiTestoArticolo(url) {
+  // Prova con diversi User-Agent in sequenza
+  for (const ua of USER_AGENTS) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+
+      const res = await fetch(url, {
+        signal:  controller.signal,
+        headers: {
+          'User-Agent':      ua,
+          'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'it-IT,it;q=0.9,en;q=0.8',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Cache-Control':   'no-cache'
+        }
+      });
+      clearTimeout(timer);
+
+      if (!res.ok) {
+        console.warn(`[Scraper] ${url} → HTTP ${res.status}`);
+        continue;
+      }
+
+      const html = await res.text();
+      if (!html || html.length < 500) continue;
+
+      // Estrai con Readability
+      const dom     = new JSDOM(html, { url });
+      const reader  = new Readability(dom.window.document);
+      const article = reader.parse();
+
+      if (!article || !article.textContent || article.textContent.trim().length < 150) {
+        console.warn(`[Scraper] ${url} → Readability non ha estratto testo sufficiente`);
+        continue;
+      }
+
+      // Pulisci il testo: rimuovi spazi multipli e righe vuote eccessive
+      const testo = article.textContent
+        .replace(/\n{3,}/g, '\n\n')
+        .replace(/[ \t]{2,}/g, ' ')
+        .trim();
+
+      // Tronca a 8000 caratteri — sufficiente per qualsiasi articolo
+      // Claude non ha bisogno di più per scrivere un riassunto
+      const testoCropato = testo.length > 8000
+        ? testo.slice(0, 8000) + '\n\n[testo troncato — continua sull\'articolo originale]'
+        : testo;
+
+      console.log(`[Scraper] ✅ ${url} → ${testoCropato.length} caratteri estratti`);
+      return {
+        ok:      true,
+        titolo:  article.title    || '',
+        autore:  article.byline   || '',
+        testo:   testoCropato,
+        estratto: article.excerpt || ''
+      };
+
+    } catch (e) {
+      console.warn(`[Scraper] ${url} con UA ${ua.slice(0, 30)}... → ${e.message}`);
+    }
+  }
+
+  // Tutti i tentativi falliti
+  return { ok: false, testo: '', motivo: 'Pagina non accessibile (paywall, errore, o blocco)' };
+}
 
 // ══════════════════════════════════════════════
 //  NOTION API HELPER
@@ -34,98 +114,111 @@ async function notionRequest(endpoint, method = 'GET', body = null) {
 
 // ══════════════════════════════════════════════
 //  TROVA O CREA DATABASE
-//  Priorità:
-//  1. variabile d'ambiente NOTION_DATABASE_ID  (più veloce)
-//  2. cerca tra i database figli della pagina padre
-//  3. crea nuovo database
 // ══════════════════════════════════════════════
 async function getOrCreateDatabase() {
-
-  // 1. Abbiamo già l'ID in memoria o da env — verifica che esista
   if (NOTION_DATABASE_ID) {
     try {
       await notionRequest(`/databases/${NOTION_DATABASE_ID}`);
-      return NOTION_DATABASE_ID; // ✅ esiste, usalo
-    } catch (e) {
-      console.warn('[Notion] Database ID non valido, cerco tra i figli...');
+      return NOTION_DATABASE_ID;
+    } catch {
+      console.warn('[Notion] Database ID non valido, cerco...');
       NOTION_DATABASE_ID = '';
     }
   }
 
-  // 2. Cerca tra i blocchi figli della pagina padre un database con il nostro titolo
+  // Cerca tra i figli della pagina padre
   try {
     const children = await notionRequest(`/blocks/${NOTION_PAGE_ID}/children?page_size=100`);
     for (const block of children.results) {
       if (block.type === 'child_database') {
-        // Recupera il titolo del database
         try {
-          const db = await notionRequest(`/databases/${block.id}`);
-          const titolo = db.title?.[0]?.text?.content || '';
-          if (titolo.includes('NewsRadar')) {
+          const db    = await notionRequest(`/databases/${block.id}`);
+          const title = db.title?.[0]?.text?.content || '';
+          if (title.includes('NewsRadar')) {
             NOTION_DATABASE_ID = block.id;
-            console.log(`[Notion] Database trovato tra i figli: ${block.id}`);
+            console.log(`[Notion] Database trovato: ${block.id}`);
             return NOTION_DATABASE_ID;
           }
-        } catch (e) {
-          // blocco non accessibile, skip
-        }
+        } catch { /* skip */ }
       }
     }
   } catch (e) {
-    console.warn('[Notion] Errore nella ricerca dei figli:', e.message);
+    console.warn('[Notion] Errore ricerca figli:', e.message);
   }
 
-  // 3. Non trovato — crea nuovo
-  console.log('[Notion] Creo il database NewsRadar...');
+  // Crea nuovo
+  console.log('[Notion] Creo database...');
   const db = await notionRequest('/databases', 'POST', {
     parent: { page_id: NOTION_PAGE_ID },
     title:  [{ type: 'text', text: { content: '📰 NewsRadar — Articoli' } }],
     icon:   { emoji: '📰' },
     properties: {
-      'Titolo':          { title: {} },
+      'Titolo':           { title: {} },
       'Status': {
         select: {
           options: [
-            { name: 'In attesa',  color: 'yellow' },
-            { name: 'Elaborato',  color: 'green'  },
-            { name: 'Pubblicato', color: 'blue'   }
+            { name: 'In attesa',    color: 'yellow' },
+            { name: 'In scraping',  color: 'orange' },
+            { name: 'Pronto',       color: 'green'  },
+            { name: 'Inaccessibile',color: 'red'    },
+            { name: 'Elaborato',    color: 'blue'   },
+            { name: 'Pubblicato',   color: 'purple' }
           ]
         }
       },
-      'URL originale':   { url: {} },
-      'Fonte':           { rich_text: {} },
-      'Data originale':  { rich_text: {} },
-      'Testo elaborato': { rich_text: {} },
-      'Inviato il':      { date: {} },
-      'Article ID':      { rich_text: {} }
+      'URL originale':    { url: {} },
+      'Fonte':            { rich_text: {} },
+      'Data originale':   { rich_text: {} },
+      // ← NUOVO: testo già estratto — Claude non deve più navigare l'URL
+      'Contenuto estratto': { rich_text: {} },
+      'Testo elaborato':  { rich_text: {} },
+      'Inviato il':       { date: {} },
+      'Article ID':       { rich_text: {} }
     }
   });
 
   NOTION_DATABASE_ID = db.id;
   console.log(`[Notion] Database creato: ${db.id}`);
-  console.log(`[Notion] ⚠️  Salva questo ID su Render come NOTION_DATABASE_ID=${db.id}`);
+  console.log(`[Notion] ⚠️  Aggiungi su Render: NOTION_DATABASE_ID=${db.id}`);
   return NOTION_DATABASE_ID;
 }
 
 // ══════════════════════════════════════════════
-//  AGGIUNGE ARTICOLI AL DATABASE
+//  AGGIUNGE ARTICOLI — con scraping automatico
 // ══════════════════════════════════════════════
 async function aggiungiArticoliAlDatabase(articoli) {
-  const dbId     = await getOrCreateDatabase();
+  const dbId      = await getOrCreateDatabase();
   const risultati = [];
 
   for (const a of articoli) {
+    console.log(`[Scraper] Estraggo: ${a.titolo}`);
+
+    // Estrai il testo dell'articolo prima di salvarlo su Notion
+    const scraped = await estraiTestoArticolo(a.url);
+
+    const status = scraped.ok ? 'Pronto' : 'Inaccessibile';
+
+    // Notion limita rich_text a 2000 caratteri per blocco
+    const contenutoChunks = [];
+    const testo = scraped.testo || '';
+    for (let i = 0; i < testo.length; i += 2000) {
+      contenutoChunks.push({ text: { content: testo.slice(i, i + 2000) } });
+    }
+    // Max 100 blocchi = 200.000 caratteri — più che sufficiente
+    const contenutoNotion = contenutoChunks.slice(0, 100);
+
     const page = await notionRequest('/pages', 'POST', {
       parent:     { database_id: dbId },
       properties: {
-        'Titolo':          { title:     [{ text: { content: a.titolo || '' } }] },
-        'Status':          { select:    { name: 'In attesa' } },
-        'URL originale':   { url:       a.url  || null },
-        'Fonte':           { rich_text: [{ text: { content: a.fonte || '' } }] },
-        'Data originale':  { rich_text: [{ text: { content: a.data  || '' } }] },
-        'Testo elaborato': { rich_text: [{ text: { content: '' } }] },
-        'Inviato il':      { date:      { start: new Date().toISOString() } },
-        'Article ID':      { rich_text: [{ text: { content: a.articleId || '' } }] }
+        'Titolo':             { title:     [{ text: { content: a.titolo || '' } }] },
+        'Status':             { select:    { name: status } },
+        'URL originale':      { url:       a.url  || null },
+        'Fonte':              { rich_text: [{ text: { content: a.fonte || '' } }] },
+        'Data originale':     { rich_text: [{ text: { content: a.data  || '' } }] },
+        'Contenuto estratto': { rich_text: contenutoNotion.length > 0 ? contenutoNotion : [{ text: { content: scraped.motivo || '' } }] },
+        'Testo elaborato':    { rich_text: [{ text: { content: '' } }] },
+        'Inviato il':         { date:      { start: new Date().toISOString() } },
+        'Article ID':         { rich_text: [{ text: { content: a.articleId || '' } }] }
       }
     });
 
@@ -133,10 +226,12 @@ async function aggiungiArticoliAlDatabase(articoli) {
       notionPageId: page.id,
       notionUrl:    page.url,
       titolo:       a.titolo,
-      articleId:    a.articleId
+      articleId:    a.articleId,
+      scraped:      scraped.ok,
+      caratteri:    testo.length
     });
 
-    console.log(`[Notion] Aggiunto: ${a.titolo}`);
+    console.log(`[Notion] Salvato: ${a.titolo} (${status}, ${testo.length} caratteri)`);
   }
 
   return { dbId, risultati };
@@ -147,11 +242,9 @@ async function aggiungiArticoliAlDatabase(articoli) {
 // ══════════════════════════════════════════════
 async function aggiornaArticolo(notionPageId, { status, testoElaborato }) {
   const properties = {};
-
   if (status) {
     properties['Status'] = { select: { name: status } };
   }
-
   if (testoElaborato) {
     const chunks = [];
     for (let i = 0; i < testoElaborato.length; i += 2000) {
@@ -159,30 +252,45 @@ async function aggiornaArticolo(notionPageId, { status, testoElaborato }) {
     }
     properties['Testo elaborato'] = { rich_text: chunks.slice(0, 100) };
   }
-
   await notionRequest(`/pages/${notionPageId}`, 'PATCH', { properties });
   return { ok: true };
 }
 
 // ══════════════════════════════════════════════
-//  LEGGI ARTICOLI IN ATTESA
+//  LEGGI ARTICOLI PRONTI (status = "Pronto")
+//  Claude non deve più navigare URL — legge solo
+//  il "Contenuto estratto" già pronto su Notion
 // ══════════════════════════════════════════════
 async function leggiArticoliInAttesa() {
   const dbId = await getOrCreateDatabase();
 
+  // Leggi sia "Pronto" che "In attesa" (retrocompatibilità)
   const res = await notionRequest(`/databases/${dbId}/query`, 'POST', {
-    filter: { property: 'Status', select: { equals: 'In attesa' } },
-    sorts:  [{ property: 'Inviato il', direction: 'descending' }]
+    filter: {
+      or: [
+        { property: 'Status', select: { equals: 'Pronto' } },
+        { property: 'Status', select: { equals: 'In attesa' } }
+      ]
+    },
+    sorts: [{ property: 'Inviato il', direction: 'descending' }]
   });
 
-  return res.results.map(page => ({
-    notionPageId: page.id,
-    titolo:       page.properties['Titolo']?.title?.[0]?.text?.content     || '',
-    url:          page.properties['URL originale']?.url                    || '',
-    fonte:        page.properties['Fonte']?.rich_text?.[0]?.text?.content  || '',
-    data:         page.properties['Data originale']?.rich_text?.[0]?.text?.content || '',
-    articleId:    page.properties['Article ID']?.rich_text?.[0]?.text?.content     || ''
-  }));
+  return res.results.map(page => {
+    // Ricostruisci il contenuto estratto dai chunk
+    const chunks  = page.properties['Contenuto estratto']?.rich_text || [];
+    const contenuto = chunks.map(c => c.text?.content || '').join('');
+
+    return {
+      notionPageId: page.id,
+      titolo:       page.properties['Titolo']?.title?.[0]?.text?.content            || '',
+      url:          page.properties['URL originale']?.url                            || '',
+      fonte:        page.properties['Fonte']?.rich_text?.[0]?.text?.content         || '',
+      data:         page.properties['Data originale']?.rich_text?.[0]?.text?.content || '',
+      articleId:    page.properties['Article ID']?.rich_text?.[0]?.text?.content    || '',
+      // ← IL TESTO GIÀ ESTRATTO — Claude usa questo, non web_fetch
+      contenuto:    contenuto
+    };
+  });
 }
 
 // ══════════════════════════════════════════════
@@ -191,7 +299,7 @@ async function leggiArticoliInAttesa() {
 const TOOLS = [
   {
     name: 'invia_articoli',
-    description: 'Aggiunge articoli da NewsRadar al database Notion con status "In attesa".',
+    description: 'Aggiunge articoli da NewsRadar al database Notion. Il server estrae automaticamente il testo completo di ogni articolo prima di salvarlo — Claude non dovrà navigare gli URL.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -215,19 +323,19 @@ const TOOLS = [
     }
   },
   {
-    name: 'leggi_articoli_in_attesa',
-    description: 'Restituisce tutti gli articoli con status "In attesa" dal database Notion.',
+    name: 'leggi_articoli_pronti',
+    description: 'Restituisce gli articoli pronti per l\'elaborazione dal database Notion. Ogni articolo include il testo completo già estratto — usa questo testo per scrivere l\'articolo senza chiamare web_fetch.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'aggiorna_articolo',
-    description: 'Aggiorna un articolo nel database Notion con testo elaborato e status.',
+    description: 'Aggiorna un articolo nel database Notion con il testo elaborato e cambia lo status.',
     inputSchema: {
       type: 'object',
       properties: {
-        notionPageId:   { type: 'string' },
-        testoElaborato: { type: 'string' },
-        status:         { type: 'string', enum: ['In attesa', 'Elaborato', 'Pubblicato'] }
+        notionPageId:   { type: 'string', description: 'ID della pagina Notion' },
+        testoElaborato: { type: 'string', description: 'Testo dell\'articolo riscritto' },
+        status:         { type: 'string', enum: ['In attesa', 'Pronto', 'Inaccessibile', 'Elaborato', 'Pubblicato'] }
       },
       required: ['notionPageId']
     }
@@ -240,18 +348,25 @@ async function executeTool(name, args) {
     if (!articoli || articoli.length === 0)
       return { content: [{ type: 'text', text: 'Errore: nessun articolo.' }], isError: true };
     const risultato = await aggiungiArticoliAlDatabase(articoli);
-    const lista = risultato.risultati.map(r => `- ${r.titolo}`).join('\n');
-    return { content: [{ type: 'text', text: `✅ ${articoli.length} articoli aggiunti.\n\n${lista}` }] };
+    const lista = risultato.risultati.map(r =>
+      `- ${r.titolo} → ${r.scraped ? `✅ ${r.caratteri} caratteri estratti` : '❌ non accessibile'}`
+    ).join('\n');
+    return { content: [{ type: 'text', text: `✅ ${articoli.length} articoli elaborati:\n\n${lista}` }] };
   }
 
-  if (name === 'leggi_articoli_in_attesa') {
+  if (name === 'leggi_articoli_pronti') {
     const articoli = await leggiArticoliInAttesa();
     if (articoli.length === 0)
-      return { content: [{ type: 'text', text: 'Nessun articolo in attesa.' }] };
-    const lista = articoli.map((a, i) =>
-      `${i + 1}. **${a.titolo}**\n   ID: ${a.notionPageId}\n   URL: ${a.url}`
-    ).join('\n\n');
-    return { content: [{ type: 'text', text: `📋 ${articoli.length} articoli in attesa:\n\n${lista}` }] };
+      return { content: [{ type: 'text', text: 'Nessun articolo pronto per l\'elaborazione.' }] };
+
+    const lista = articoli.map((a, i) => {
+      const anteprima = a.contenuto
+        ? `\n   📄 Contenuto (${a.contenuto.length} caratteri): ${a.contenuto.slice(0, 200)}...`
+        : '\n   ⚠️  Nessun contenuto estratto — usa web_fetch come fallback';
+      return `${i + 1}. **${a.titolo}**\n   ID: ${a.notionPageId}\n   Fonte: ${a.fonte}\n   URL: ${a.url}${anteprima}`;
+    }).join('\n\n');
+
+    return { content: [{ type: 'text', text: `📋 ${articoli.length} articoli pronti:\n\n${lista}` }] };
   }
 
   if (name === 'aggiorna_articolo') {
@@ -262,20 +377,25 @@ async function executeTool(name, args) {
     return { content: [{ type: 'text', text: `✅ Articolo aggiornato — Status: ${status || 'Elaborato'}` }] };
   }
 
+  // Retrocompatibilità con vecchio nome tool
+  if (name === 'leggi_articoli_in_attesa') {
+    return executeTool('leggi_articoli_pronti', args);
+  }
+
   return { content: [{ type: 'text', text: `Tool "${name}" non trovato.` }], isError: true };
 }
 
 // ══════════════════════════════════════════════
 //  MCP PROTOCOL
 // ══════════════════════════════════════════════
-function mcpResponse(id, result)        { return { jsonrpc: '2.0', id, result }; }
-function mcpError(id, code, message)    { return { jsonrpc: '2.0', id, error: { code, message } }; }
+function mcpResponse(id, result)     { return { jsonrpc: '2.0', id, result }; }
+function mcpError(id, code, message) { return { jsonrpc: '2.0', id, error: { code, message } }; }
 
 async function handleMessage(msg) {
   const { method, params, id } = msg;
-  if (method === 'initialize')               return mcpResponse(id, { protocolVersion: '2025-03-26', serverInfo: { name: SERVER_NAME, version: SERVER_VERSION }, capabilities: { tools: {} } });
+  if (method === 'initialize')                return mcpResponse(id, { protocolVersion: '2025-03-26', serverInfo: { name: SERVER_NAME, version: SERVER_VERSION }, capabilities: { tools: {} } });
   if (method === 'notifications/initialized') return null;
-  if (method === 'tools/list')               return mcpResponse(id, { tools: TOOLS });
+  if (method === 'tools/list')                return mcpResponse(id, { tools: TOOLS });
   if (method === 'tools/call') {
     const { name, arguments: toolArgs } = params;
     try   { return mcpResponse(id, await executeTool(name, toolArgs || {})); }
@@ -293,10 +413,10 @@ app.get('/', (req, res) => res.json({
   version:  SERVER_VERSION,
   status:   'ok',
   notion:   !!NOTION_TOKEN,
-  database: NOTION_DATABASE_ID || 'verrà cercato/creato al primo invio'
+  database: NOTION_DATABASE_ID || 'cercato alla prima richiesta'
 }));
 
-// Sito → aggiunge articoli al database
+// Sito → aggiunge articoli (con scraping automatico)
 app.post('/notion', async (req, res) => {
   try {
     const { articoli } = req.body;
@@ -310,7 +430,7 @@ app.post('/notion', async (req, res) => {
   }
 });
 
-// Sito → aggiorna status articolo
+// Sito → aggiorna status
 app.patch('/notion/:pageId', async (req, res) => {
   try {
     const { pageId } = req.params;
@@ -323,19 +443,19 @@ app.patch('/notion/:pageId', async (req, res) => {
   }
 });
 
-// Sito → legge status singolo articolo
+// Sito → status singolo articolo
 app.get('/notion/status/:articleId', async (req, res) => {
   try {
-    const dbId      = await getOrCreateDatabase();
+    const dbId          = await getOrCreateDatabase();
     const { articleId } = req.params;
-    const result    = await notionRequest(`/databases/${dbId}/query`, 'POST', {
+    const result        = await notionRequest(`/databases/${dbId}/query`, 'POST', {
       filter: { property: 'Article ID', rich_text: { equals: articleId } }
     });
     if (result.results.length === 0) return res.json({ ok: true, status: null });
     const page = result.results[0];
     res.json({
-      ok:          true,
-      status:      page.properties['Status']?.select?.name || null,
+      ok:           true,
+      status:       page.properties['Status']?.select?.name || null,
       notionPageId: page.id,
       notionUrl:    page.url
     });
@@ -353,7 +473,7 @@ app.post('/mcp', async (req, res) => {
     const r = await handleMessage(msg);
     if (r !== null) responses.push(r);
   }
-  if (responses.length === 0)                          return res.status(204).end();
+  if (responses.length === 0)                             return res.status(204).end();
   if (responses.length === 1 && !Array.isArray(req.body)) return res.json(responses[0]);
   return res.json(responses);
 });
@@ -371,5 +491,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n🚀 NewsRadar MCP Server v${SERVER_VERSION} — porta ${PORT}`);
   console.log(`   Notion token:    ${NOTION_TOKEN      ? '✅' : '❌ MANCANTE'}`);
-  console.log(`   Database ID:     ${NOTION_DATABASE_ID || 'cercato automaticamente alla prima richiesta'}\n`);
+  console.log(`   Database ID:     ${NOTION_DATABASE_ID || 'cercato automaticamente'}`);
+  console.log(`   Scraping:        ✅ Readability attivo\n`);
 });
