@@ -46,27 +46,16 @@ async function inizializzaFoglio() {
   try {
     const res = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'A1:J1'
+      range: 'A1:D1'
     });
     const valori = res.data.values;
     if (!valori || valori.length === 0) {
       await sheetsClient.spreadsheets.values.update({
         spreadsheetId: GOOGLE_SHEET_ID,
-        range: 'A1:J1',
+        range: 'A1:D1',
         valueInputOption: 'RAW',
         requestBody: {
-          values: [[
-            'Data invio',
-            'Titolo',
-            'Fonte',
-            'URL originale',
-            'Status',
-            'Testo estratto (anteprima)',
-            'Notion Page ID',
-            'Notion URL',
-            'Article ID',
-            'Data originale'
-          ]]
+          values: [['Data invio', 'Titolo', 'URL originale', 'Testo estratto']]
         }
       });
       console.log('[Sheets] ✅ Intestazioni create');
@@ -77,6 +66,7 @@ async function inizializzaFoglio() {
 }
 
 // Aggiunge una riga per ogni articolo
+// Colonne: Data invio | Titolo | URL originale | Testo estratto (intero)
 async function aggiungiRigheSheets(articoli) {
   if (!sheetsClient || !GOOGLE_SHEET_ID) {
     console.warn('[Sheets] Client non disponibile — skip');
@@ -86,19 +76,14 @@ async function aggiungiRigheSheets(articoli) {
     const righe = articoli.map(a => [
       new Date().toLocaleString('it-IT'),
       a.titolo       || '',
-      a.fonte        || '',
       a.url          || '',
-      'In attesa',
-      a.testoCropato ? a.testoCropato.slice(0, 500) + '...' : '',
-      a.notionPageId || '',
-      a.notionUrl    || '',
-      a.articleId    || '',
-      a.data         || ''
+      // Testo intero — Google Sheets supporta fino a 50.000 caratteri per cella
+      (a.testoCropato || '').slice(0, 49000)
     ]);
 
     await sheetsClient.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range:         'A:J',
+      range:         'A:D',
       valueInputOption: 'RAW',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: righe }
@@ -106,7 +91,6 @@ async function aggiungiRigheSheets(articoli) {
 
     console.log(`[Sheets] ✅ ${articoli.length} righe aggiunte`);
   } catch (e) {
-    // Non bloccare il flusso se Sheets fallisce
     console.error('[Sheets] Errore aggiunta righe:', e.message);
   }
 }
