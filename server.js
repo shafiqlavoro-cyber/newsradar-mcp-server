@@ -2,16 +2,140 @@ import express from 'express';
 import cors from 'cors';
 import { Readability } from '@mozilla/readability';
 import { JSDOM } from 'jsdom';
+import { google } from 'googleapis';
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 const SERVER_NAME    = 'newsradar-mcp';
-const SERVER_VERSION = '2.3.0';
+const SERVER_VERSION = '2.4.0';
 const NOTION_TOKEN   = process.env.NOTION_TOKEN   || '';
 const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID || '336a3e42e9f180e59794e22a4a7fb751';
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID || '';
 let   NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || '';
+
+// ══════════════════════════════════════════════
+//  GOOGLE SHEETS — inizializzazione
+// ══════════════════════════════════════════════
+let sheetsClient = null;
+
+function initGoogleSheets() {
+  try {
+    const raw = process.env.GOOGLE_SERVICE_ACCOUNT;
+    if (!raw) { console.warn('[Sheets] GOOGLE_SERVICE_ACCOUNT non configurata'); return; }
+
+    const credentials = JSON.parse(raw);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+      ]
+    });
+    sheetsClient = google.sheets({ version: 'v4', auth });
+    console.log('[Sheets] ✅ Client inizializzato');
+  } catch (e) {
+    console.error('[Sheets] Errore inizializzazione:', e.message);
+  }
+}
+
+// Crea intestazioni se il foglio è vuoto
+async function inizializzaFoglio() {
+  if (!sheetsClient || !GOOGLE_SHEET_ID) return;
+  try {
+    const res = await sheetsClient.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'A1:J1'
+    });
+    const valori = res.data.values;
+    if (!valori || valori.length === 0) {
+      await sheetsClient.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        range: 'A1:J1',
+        valueInputOption: 'RAW',
+        requestBody: {
+          values: [[
+            'Data invio',
+            'Titolo',
+            'Fonte',
+            'URL originale',
+            'Status',
+            'Testo estratto (anteprima)',
+            'Notion Page ID',
+            'Notion URL',
+            'Article ID',
+            'Data originale'
+          ]]
+        }
+      });
+      console.log('[Sheets] ✅ Intestazioni create');
+    }
+  } catch (e) {
+    console.warn('[Sheets] Errore inizializzazione foglio:', e.message);
+  }
+}
+
+// Aggiunge una riga per ogni articolo
+async function aggiungiRigheSheets(articoli) {
+  if (!sheetsClient || !GOOGLE_SHEET_ID) {
+    console.warn('[Sheets] Client non disponibile — skip');
+    return;
+  }
+  try {
+    const righe = articoli.map(a => [
+      new Date().toLocaleString('it-IT'),
+      a.titolo       || '',
+      a.fonte        || '',
+      a.url          || '',
+      'In attesa',
+      a.testoCropato ? a.testoCropato.slice(0, 500) + '...' : '',
+      a.notionPageId || '',
+      a.notionUrl    || '',
+      a.articleId    || '',
+      a.data         || ''
+    ]);
+
+    await sheetsClient.spreadsheets.values.append({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range:         'A:J',
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: righe }
+    });
+
+    console.log(`[Sheets] ✅ ${articoli.length} righe aggiunte`);
+  } catch (e) {
+    // Non bloccare il flusso se Sheets fallisce
+    console.error('[Sheets] Errore aggiunta righe:', e.message);
+  }
+}
+
+// Aggiorna lo status di un articolo nel foglio
+async function aggiornaStatusSheets(notionPageId, status) {
+  if (!sheetsClient || !GOOGLE_SHEET_ID) return;
+  try {
+    // Cerca la riga con questo notionPageId nella colonna G
+    const res = await sheetsClient.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'G:G'
+    });
+    const rows = res.data.values || [];
+    const rowIndex = rows.findIndex(r => r[0] === notionPageId);
+    if (rowIndex === -1) return;
+
+    const rigaSheet = rowIndex + 1; // 1-indexed
+    await sheetsClient.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range:         `E${rigaSheet}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[status]] }
+    });
+    console.log(`[Sheets] ✅ Status aggiornato riga ${rigaSheet}: ${status}`);
+  } catch (e) {
+    console.warn('[Sheets] Errore aggiornamento status:', e.message);
+  }
+}
 
 // ══════════════════════════════════════════════
 //  ESTRAZIONE TESTO ARTICOLO
@@ -87,15 +211,13 @@ async function notionRequest(endpoint, method = 'GET', body = null) {
 }
 
 // ══════════════════════════════════════════════
-//  AGGIORNA SCHEMA DATABASE
-//  Aggiunge le proprietà mancanti a un database
-//  già esistente — senza toccare i dati
+//  AGGIORNA SCHEMA DATABASE NOTION
 // ══════════════════════════════════════════════
 async function aggiornaSchemaDatabaseSeNecessario(dbId) {
-  const db = await notionRequest(`/databases/${dbId}`);
+  const db    = await notionRequest(`/databases/${dbId}`);
   const props = db.properties || {};
 
-  const proprieta_necessarie = {
+  const necessarie = {
     'Contenuto estratto': { rich_text: {} },
     'Testo elaborato':    { rich_text: {} },
     'Fonte':              { rich_text: {} },
@@ -116,43 +238,32 @@ async function aggiornaSchemaDatabaseSeNecessario(dbId) {
     }
   };
 
-  // Costruisci solo le proprietà mancanti
   const da_aggiungere = {};
-  for (const [nome, schema] of Object.entries(proprieta_necessarie)) {
-    if (!props[nome]) {
-      da_aggiungere[nome] = schema;
-      console.log(`[Notion] Aggiungo proprietà mancante: "${nome}"`);
-    }
+  for (const [nome, schema] of Object.entries(necessarie)) {
+    if (!props[nome]) { da_aggiungere[nome] = schema; console.log(`[Notion] Aggiungo: "${nome}"`); }
   }
 
   if (Object.keys(da_aggiungere).length > 0) {
-    await notionRequest(`/databases/${dbId}`, 'PATCH', {
-      properties: da_aggiungere
-    });
-    console.log(`[Notion] Schema aggiornato con ${Object.keys(da_aggiungere).length} proprietà.`);
-  } else {
-    console.log(`[Notion] Schema già completo.`);
+    await notionRequest(`/databases/${dbId}`, 'PATCH', { properties: da_aggiungere });
+    console.log(`[Notion] Schema aggiornato.`);
   }
 }
 
 // ══════════════════════════════════════════════
-//  TROVA O CREA DATABASE
+//  TROVA O CREA DATABASE NOTION
 // ══════════════════════════════════════════════
 async function getOrCreateDatabase() {
-  // 1. Usa ID da env o memoria
   if (NOTION_DATABASE_ID) {
     try {
       await notionRequest(`/databases/${NOTION_DATABASE_ID}`);
-      // Verifica e aggiorna lo schema se necessario
       await aggiornaSchemaDatabaseSeNecessario(NOTION_DATABASE_ID);
       return NOTION_DATABASE_ID;
     } catch {
-      console.warn('[Notion] Database ID non valido, cerco tra i figli...');
+      console.warn('[Notion] Database ID non valido, cerco...');
       NOTION_DATABASE_ID = '';
     }
   }
 
-  // 2. Cerca tra i figli della pagina
   try {
     const children = await notionRequest(`/blocks/${NOTION_PAGE_ID}/children?page_size=100`);
     for (const block of children.results) {
@@ -163,7 +274,6 @@ async function getOrCreateDatabase() {
           if (title.includes('NewsRadar')) {
             NOTION_DATABASE_ID = block.id;
             console.log(`[Notion] Database trovato: ${block.id}`);
-            // Aggiorna schema se ha proprietà mancanti
             await aggiornaSchemaDatabaseSeNecessario(NOTION_DATABASE_ID);
             return NOTION_DATABASE_ID;
           }
@@ -171,17 +281,16 @@ async function getOrCreateDatabase() {
       }
     }
   } catch (e) {
-    console.warn('[Notion] Errore ricerca figli:', e.message);
+    console.warn('[Notion] Errore ricerca:', e.message);
   }
 
-  // 3. Crea nuovo con schema completo
-  console.log('[Notion] Creo database con schema completo...');
+  console.log('[Notion] Creo database...');
   const db = await notionRequest('/databases', 'POST', {
     parent: { page_id: NOTION_PAGE_ID },
     title:  [{ type: 'text', text: { content: '📰 NewsRadar — Articoli' } }],
     icon:   { emoji: '📰' },
     properties: {
-      'Titolo':               { title: {} },
+      'Titolo':             { title: {} },
       'Status': {
         select: {
           options: [
@@ -193,43 +302,42 @@ async function getOrCreateDatabase() {
           ]
         }
       },
-      'URL originale':        { url: {} },
-      'Fonte':                { rich_text: {} },
-      'Data originale':       { rich_text: {} },
-      'Contenuto estratto':   { rich_text: {} },
-      'Testo elaborato':      { rich_text: {} },
-      'Inviato il':           { date: {} },
-      'Article ID':           { rich_text: {} }
+      'URL originale':      { url: {} },
+      'Fonte':              { rich_text: {} },
+      'Data originale':     { rich_text: {} },
+      'Contenuto estratto': { rich_text: {} },
+      'Testo elaborato':    { rich_text: {} },
+      'Inviato il':         { date: {} },
+      'Article ID':         { rich_text: {} }
     }
   });
 
   NOTION_DATABASE_ID = db.id;
-  console.log(`[Notion] Database creato: ${db.id}`);
+  console.log(`[Notion] Creato: ${db.id}`);
   return NOTION_DATABASE_ID;
 }
 
 // ══════════════════════════════════════════════
-//  AGGIUNGE ARTICOLI — con scraping automatico
+//  AGGIUNGE ARTICOLI — Notion + Google Sheets
 // ══════════════════════════════════════════════
 async function aggiungiArticoliAlDatabase(articoli) {
   const dbId      = await getOrCreateDatabase();
   const risultati = [];
+  const perSheets = [];
 
   for (const a of articoli) {
     console.log(`[Scraper] Estraggo: ${a.titolo}`);
     const scraped = await estraiTestoArticolo(a.url);
     const status  = scraped.ok ? 'Pronto' : 'Inaccessibile';
 
-    // Spezza il testo in chunk da 2000 caratteri (limite Notion)
-    const testo   = scraped.testo || scraped.motivo || '';
-    const chunks  = [];
+    const testo  = scraped.testo || scraped.motivo || '';
+    const chunks = [];
     for (let i = 0; i < testo.length; i += 2000) {
       chunks.push({ text: { content: testo.slice(i, i + 2000) } });
     }
-    const contenutoNotion = chunks.length > 0
-      ? chunks.slice(0, 100)
-      : [{ text: { content: '' } }];
+    const contenutoNotion = chunks.length > 0 ? chunks.slice(0, 100) : [{ text: { content: '' } }];
 
+    // Salva su Notion
     const page = await notionRequest('/pages', 'POST', {
       parent:     { database_id: dbId },
       properties: {
@@ -245,29 +353,44 @@ async function aggiungiArticoliAlDatabase(articoli) {
       }
     });
 
-    risultati.push({
+    const r = {
       notionPageId: page.id,
       notionUrl:    page.url,
       titolo:       a.titolo,
       articleId:    a.articleId,
       scraped:      scraped.ok,
       caratteri:    testo.length
+    };
+
+    risultati.push(r);
+
+    // Prepara dati per Google Sheets
+    perSheets.push({
+      titolo:       a.titolo,
+      fonte:        a.fonte,
+      url:          a.url,
+      data:         a.data,
+      articleId:    a.articleId,
+      notionPageId: page.id,
+      notionUrl:    page.url,
+      testoCropato: testo
     });
 
     console.log(`[Notion] ✅ "${a.titolo}" → ${status} (${testo.length} car.)`);
   }
 
+  // Salva su Google Sheets in parallelo (non blocca se fallisce)
+  await aggiungiRigheSheets(perSheets);
+
   return { dbId, risultati };
 }
 
 // ══════════════════════════════════════════════
-//  AGGIORNA ARTICOLO
+//  AGGIORNA ARTICOLO — Notion + Google Sheets
 // ══════════════════════════════════════════════
 async function aggiornaArticolo(notionPageId, { status, testoElaborato }) {
   const properties = {};
-  if (status) {
-    properties['Status'] = { select: { name: status } };
-  }
+  if (status) properties['Status'] = { select: { name: status } };
   if (testoElaborato) {
     const chunks = [];
     for (let i = 0; i < testoElaborato.length; i += 2000) {
@@ -275,7 +398,12 @@ async function aggiornaArticolo(notionPageId, { status, testoElaborato }) {
     }
     properties['Testo elaborato'] = { rich_text: chunks.slice(0, 100) };
   }
+
   await notionRequest(`/pages/${notionPageId}`, 'PATCH', { properties });
+
+  // Aggiorna anche Google Sheets
+  if (status) await aggiornaStatusSheets(notionPageId, status);
+
   return { ok: true };
 }
 
@@ -284,8 +412,7 @@ async function aggiornaArticolo(notionPageId, { status, testoElaborato }) {
 // ══════════════════════════════════════════════
 async function leggiArticoliInAttesa() {
   const dbId = await getOrCreateDatabase();
-
-  const res = await notionRequest(`/databases/${dbId}/query`, 'POST', {
+  const res  = await notionRequest(`/databases/${dbId}/query`, 'POST', {
     filter: {
       or: [
         { property: 'Status', select: { equals: 'Pronto' } },
@@ -316,7 +443,7 @@ async function leggiArticoliInAttesa() {
 const TOOLS = [
   {
     name: 'invia_articoli',
-    description: 'Aggiunge articoli da NewsRadar al database Notion estraendo automaticamente il testo completo.',
+    description: 'Aggiunge articoli al database Notion e Google Sheets, estraendo il testo automaticamente.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -325,11 +452,8 @@ const TOOLS = [
           items: {
             type: 'object',
             properties: {
-              articleId:   { type: 'string' },
-              titolo:      { type: 'string' },
-              url:         { type: 'string' },
-              fonte:       { type: 'string' },
-              data:        { type: 'string' }
+              articleId: { type: 'string' }, titolo: { type: 'string' },
+              url:       { type: 'string' }, fonte:  { type: 'string' }, data: { type: 'string' }
             },
             required: ['titolo', 'url']
           }
@@ -340,12 +464,12 @@ const TOOLS = [
   },
   {
     name: 'leggi_articoli_pronti',
-    description: 'Restituisce gli articoli pronti con il testo già estratto. Usa il campo "contenuto" invece di web_fetch.',
+    description: 'Legge gli articoli pronti dal database. Ogni articolo include il testo già estratto — usalo invece di web_fetch.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'aggiorna_articolo',
-    description: 'Aggiorna un articolo con il testo elaborato e lo status.',
+    description: 'Aggiorna un articolo su Notion e Google Sheets con testo elaborato e status.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -359,18 +483,17 @@ const TOOLS = [
 ];
 
 async function executeTool(name, args) {
-  // Retrocompatibilità
   if (name === 'leggi_articoli_in_attesa') name = 'leggi_articoli_pronti';
 
   if (name === 'invia_articoli') {
     const { articoli } = args;
     if (!articoli || articoli.length === 0)
-      return { content: [{ type: 'text', text: 'Errore: nessun articolo.' }], isError: true };
+      return { content: [{ type: 'text', text: 'Nessun articolo.' }], isError: true };
     const r    = await aggiungiArticoliAlDatabase(articoli);
     const lista = r.risultati.map(x =>
       `- ${x.titolo} → ${x.scraped ? `✅ ${x.caratteri} car.` : '❌ non accessibile'}`
     ).join('\n');
-    return { content: [{ type: 'text', text: `✅ ${articoli.length} articoli elaborati:\n${lista}` }] };
+    return { content: [{ type: 'text', text: `✅ ${articoli.length} articoli:\n${lista}` }] };
   }
 
   if (name === 'leggi_articoli_pronti') {
@@ -378,10 +501,8 @@ async function executeTool(name, args) {
     if (articoli.length === 0)
       return { content: [{ type: 'text', text: 'Nessun articolo pronto.' }] };
     const lista = articoli.map((a, i) => {
-      const anteprima = a.contenuto
-        ? `\n   📄 ${a.contenuto.length} caratteri disponibili`
-        : '\n   ⚠️  Nessun contenuto estratto';
-      return `${i + 1}. ${a.titolo}\n   ID: ${a.notionPageId}\n   URL: ${a.url}${anteprima}`;
+      const ant = a.contenuto ? `\n   📄 ${a.contenuto.length} caratteri disponibili` : '\n   ⚠️ Nessun contenuto';
+      return `${i + 1}. ${a.titolo}\n   ID: ${a.notionPageId}\n   URL: ${a.url}${ant}`;
     }).join('\n\n');
     return { content: [{ type: 'text', text: `📋 ${articoli.length} articoli:\n\n${lista}` }] };
   }
@@ -391,7 +512,7 @@ async function executeTool(name, args) {
     if (!notionPageId)
       return { content: [{ type: 'text', text: 'Errore: notionPageId mancante.' }], isError: true };
     await aggiornaArticolo(notionPageId, { status: status || 'Elaborato', testoElaborato });
-    return { content: [{ type: 'text', text: `✅ Aggiornato — Status: ${status || 'Elaborato'}` }] };
+    return { content: [{ type: 'text', text: `✅ Aggiornato — ${status || 'Elaborato'}` }] };
   }
 
   return { content: [{ type: 'text', text: `Tool "${name}" non trovato.` }], isError: true };
@@ -421,8 +542,12 @@ async function handleMessage(msg) {
 //  HTTP ROUTES
 // ══════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  server: SERVER_NAME, version: SERVER_VERSION, status: 'ok',
-  notion: !!NOTION_TOKEN, database: NOTION_DATABASE_ID || 'cercato alla prima richiesta'
+  server:   SERVER_NAME,
+  version:  SERVER_VERSION,
+  status:   'ok',
+  notion:   !!NOTION_TOKEN,
+  sheets:   !!(sheetsClient && GOOGLE_SHEET_ID),
+  database: NOTION_DATABASE_ID || 'cercato alla prima richiesta'
 }));
 
 app.post('/notion', async (req, res) => {
@@ -480,10 +605,17 @@ app.get('/mcp', (req, res) => {
   req.on('close', () => {});
 });
 
+// ══════════════════════════════════════════════
+//  START
+// ══════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`\n🚀 NewsRadar MCP Server v${SERVER_VERSION} — porta ${PORT}`);
-  console.log(`   Notion token:  ${NOTION_TOKEN      ? '✅' : '❌ MANCANTE'}`);
-  console.log(`   Database ID:   ${NOTION_DATABASE_ID || 'cercato automaticamente'}`);
+  console.log(`   Notion token:  ${NOTION_TOKEN       ? '✅' : '❌ MANCANTE'}`);
+  console.log(`   Database ID:   ${NOTION_DATABASE_ID  || 'cercato automaticamente'}`);
+  console.log(`   Google Sheets: ${GOOGLE_SHEET_ID     ? '✅ ' + GOOGLE_SHEET_ID : '❌ GOOGLE_SHEET_ID mancante'}`);
   console.log(`   Scraping:      ✅ Readability attivo\n`);
+
+  initGoogleSheets();
+  await inizializzaFoglio();
 });
