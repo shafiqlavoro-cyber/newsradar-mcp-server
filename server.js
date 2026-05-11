@@ -52,10 +52,10 @@ async function inizializzaFoglio() {
     if (!valori || valori.length === 0) {
       await sheetsClient.spreadsheets.values.update({
         spreadsheetId: GOOGLE_SHEET_ID,
-        range: 'A1:E1',
+        range: 'A1:F1',
         valueInputOption: 'RAW',
         requestBody: {
-          values: [['Data invio', 'Titolo', 'URL originale', 'Testo estratto', 'Status']]
+          values: [['Data invio', 'Titolo', 'URL originale', 'Fonte', 'Status', 'Testo elaborato']]
         }
       });
       console.log('[Sheets] ✅ Intestazioni create');
@@ -75,16 +75,16 @@ async function aggiungiRigheSheets(articoli) {
   try {
     const righe = articoli.map(a => [
       new Date().toLocaleString('it-IT'),
-      a.titolo       || '',
-      a.url          || '',
-      // Testo intero — Google Sheets supporta fino a 50.000 caratteri per cella
-      (a.testoCropato || '').slice(0, 49000),
-      'Da elaborare'
+      a.titolo    || '',
+      a.url       || '',
+      a.fonte     || '',
+      'Da elaborare',
+      '' // Testo elaborato — lo scrive Gemini
     ]);
 
     await sheetsClient.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range:         'A:E',
+      range:         'A:F',
       valueInputOption: 'RAW',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: righe }
@@ -133,11 +133,10 @@ async function prendiProssimoArticolo() {
     const rows = res.data.values || [];
     // Salta la riga 1 (intestazioni), cerca la prima con Status = "Da elaborare"
     for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
+      const row    = rows[i];
       const status = (row[4] || '').trim();
       if (status === 'Da elaborare') {
         const rigaSheet = i + 1;
-        // Segna subito come "In lavorazione" per evitare doppi processi
         await sheetsClient.spreadsheets.values.update({
           spreadsheetId: GOOGLE_SHEET_ID,
           range:         `E${rigaSheet}`,
@@ -146,11 +145,10 @@ async function prendiProssimoArticolo() {
         });
         console.log(`[Sheets] ✅ Riga ${rigaSheet} presa in carico`);
         return {
-          riga:         rigaSheet,
-          dataInvio:    row[0] || '',
-          titolo:       row[1] || '',
-          url:          row[2] || '',
-          testoEstratto: row[3] || ''
+          riga:   rigaSheet,
+          titolo: row[1] || '',
+          url:    row[2] || '',
+          fonte:  row[3] || ''
         };
       }
     }
