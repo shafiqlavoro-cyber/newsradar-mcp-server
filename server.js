@@ -52,10 +52,10 @@ async function inizializzaFoglio() {
     if (!valori || valori.length === 0) {
       await sheetsClient.spreadsheets.values.update({
         spreadsheetId: GOOGLE_SHEET_ID,
-        range: 'A1:D1',
+        range: 'A1:E1',
         valueInputOption: 'RAW',
         requestBody: {
-          values: [['Data invio', 'Titolo', 'URL originale', 'Testo estratto']]
+          values: [['Data invio', 'Titolo', 'URL originale', 'Testo estratto', 'Status']]
         }
       });
       console.log('[Sheets] ✅ Intestazioni create');
@@ -78,12 +78,13 @@ async function aggiungiRigheSheets(articoli) {
       a.titolo       || '',
       a.url          || '',
       // Testo intero — Google Sheets supporta fino a 50.000 caratteri per cella
-      (a.testoCropato || '').slice(0, 49000)
+      (a.testoCropato || '').slice(0, 49000),
+      'Da elaborare'
     ]);
 
     await sheetsClient.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range:         'A:D',
+      range:         'A:E',
       valueInputOption: 'RAW',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: righe }
@@ -95,20 +96,19 @@ async function aggiungiRigheSheets(articoli) {
   }
 }
 
-// Aggiorna lo status di un articolo nel foglio
-async function aggiornaStatusSheets(notionPageId, status) {
+// Aggiorna lo status di un articolo nel foglio cercando per URL (colonna C)
+async function aggiornaStatusSheets(url, status) {
   if (!sheetsClient || !GOOGLE_SHEET_ID) return;
   try {
-    // Cerca la riga con questo notionPageId nella colonna G
     const res = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'G:G'
+      range: 'C:C'
     });
-    const rows = res.data.values || [];
-    const rowIndex = rows.findIndex(r => r[0] === notionPageId);
+    const rows     = res.data.values || [];
+    const rowIndex = rows.findIndex(r => r[0] === url);
     if (rowIndex === -1) return;
 
-    const rigaSheet = rowIndex + 1; // 1-indexed
+    const rigaSheet = rowIndex + 1;
     await sheetsClient.spreadsheets.values.update({
       spreadsheetId: GOOGLE_SHEET_ID,
       range:         `E${rigaSheet}`,
@@ -118,6 +118,62 @@ async function aggiornaStatusSheets(notionPageId, status) {
     console.log(`[Sheets] ✅ Status aggiornato riga ${rigaSheet}: ${status}`);
   } catch (e) {
     console.warn('[Sheets] Errore aggiornamento status:', e.message);
+  }
+}
+
+// Legge il prossimo articolo da elaborare e lo segna "In lavorazione"
+// Gemini chiama questo endpoint, elabora, poi chiama /sheets/completa
+async function prendiProssimoArticolo() {
+  if (!sheetsClient || !GOOGLE_SHEET_ID) return null;
+  try {
+    const res = await sheetsClient.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'A:E'
+    });
+    const rows = res.data.values || [];
+    // Salta la riga 1 (intestazioni), cerca la prima con Status = "Da elaborare"
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const status = (row[4] || '').trim();
+      if (status === 'Da elaborare') {
+        const rigaSheet = i + 1;
+        // Segna subito come "In lavorazione" per evitare doppi processi
+        await sheetsClient.spreadsheets.values.update({
+          spreadsheetId: GOOGLE_SHEET_ID,
+          range:         `E${rigaSheet}`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [['In lavorazione']] }
+        });
+        console.log(`[Sheets] ✅ Riga ${rigaSheet} presa in carico`);
+        return {
+          riga:         rigaSheet,
+          dataInvio:    row[0] || '',
+          titolo:       row[1] || '',
+          url:          row[2] || '',
+          testoEstratto: row[3] || ''
+        };
+      }
+    }
+    return null; // nessun articolo disponibile
+  } catch (e) {
+    console.error('[Sheets] Errore lettura articoli:', e.message);
+    return null;
+  }
+}
+
+// Segna un articolo come completato (per URL o numero riga)
+async function completaArticolo(riga, nuovoStatus) {
+  if (!sheetsClient || !GOOGLE_SHEET_ID) return;
+  try {
+    await sheetsClient.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range:         `E${riga}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[nuovoStatus || 'Elaborato']] }
+    });
+    console.log(`[Sheets] ✅ Riga ${riga} → ${nuovoStatus || 'Elaborato'}`);
+  } catch (e) {
+    console.error('[Sheets] Errore completamento:', e.message);
   }
 }
 
@@ -543,6 +599,72 @@ app.post('/notion', async (req, res) => {
     res.json({ ok: true, dbId: risultato.dbId, articoli: risultato.risultati });
   } catch (err) {
     console.error('[/notion]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.patch('/notion/:pageId', async (req, res) => {
+  try {
+    await aggiornaArticolo(req.params.pageId, req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[PATCH]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  ENDPOINT PER GEMINI — gestione coda articoli
+// ═══════════════════════════════════════════════════════
+
+// GET /sheets/prossimo
+// Gemini chiama questo per prendere il prossimo articolo da elaborare.
+// Il server lo segna subito "In lavorazione" così non viene ripreso.
+// Risponde con: { ok, articolo: { riga, titolo, url, testoEstratto } }
+// Se non ci sono articoli: { ok: true, articolo: null }
+app.get('/sheets/prossimo', async (req, res) => {
+  try {
+    const articolo = await prendiProssimoArticolo();
+    res.json({ ok: true, articolo });
+  } catch (err) {
+    console.error('[/sheets/prossimo]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /sheets/completa
+// Gemini chiama questo quando ha finito di elaborare un articolo.
+// Body: { riga: number, status: 'Elaborato'|'Pubblicato'|'Errore' }
+app.post('/sheets/completa', async (req, res) => {
+  try {
+    const { riga, status } = req.body;
+    if (!riga) return res.status(400).json({ ok: false, error: 'riga mancante' });
+    await completaArticolo(riga, status || 'Elaborato');
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[/sheets/completa]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /sheets/stato
+// Panoramica dello stato attuale del foglio
+app.get('/sheets/stato', async (req, res) => {
+  if (!sheetsClient || !GOOGLE_SHEET_ID)
+    return res.json({ ok: false, error: 'Sheets non configurato' });
+  try {
+    const result = await sheetsClient.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'E:E'
+    });
+    const rows = (result.data.values || []).slice(1); // salta intestazione
+    const conteggio = {};
+    rows.forEach(r => {
+      const s = (r[0] || 'Sconosciuto').trim();
+      conteggio[s] = (conteggio[s] || 0) + 1;
+    });
+    res.json({ ok: true, totale: rows.length, conteggio });
+  } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
