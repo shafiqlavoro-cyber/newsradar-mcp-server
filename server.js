@@ -688,6 +688,32 @@ app.get('/hub/estrai', async (req, res) => {
   }
 });
 
+// Elimina una riga dal foglio Sheets
+app.delete('/hub/articoli/:riga', async (req, res) => {
+  if (!sheetsClient || !GOOGLE_SHEET_ID)
+    return res.status(500).json({ ok: false, error: 'Sheets non configurato' });
+  try {
+    const riga = parseInt(req.params.riga);
+    // Ottieni sheetId (0 per il primo foglio)
+    const meta = await sheetsClient.spreadsheets.get({ spreadsheetId: GOOGLE_SHEET_ID });
+    const sheetId = meta.data.sheets[0].properties.sheetId;
+    await sheetsClient.spreadsheets.batchUpdate({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      requestBody: {
+        requests: [{
+          deleteDimension: {
+            range: { sheetId, dimension: 'ROWS', startIndex: riga - 1, endIndex: riga }
+          }
+        }]
+      }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[DELETE /hub/articoli]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Aggiunta scheda manuale dal Content Hub
 app.post('/hub/aggiungi', async (req, res) => {
   if (!sheetsClient || !GOOGLE_SHEET_ID)
