@@ -612,6 +612,83 @@ app.patch('/notion/:pageId', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════
+//  ENDPOINT PER CONTENT HUB
+// ═══════════════════════════════════════════════════════
+
+// Leggi tutti gli articoli dal foglio Sheets
+app.get('/hub/articoli', async (req, res) => {
+  if (!sheetsClient || !GOOGLE_SHEET_ID)
+    return res.status(500).json({ ok: false, error: 'Sheets non configurato' });
+  try {
+    const { status } = req.query;
+    const result = await sheetsClient.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'A:F'
+    });
+    let rows = result.data.values || [];
+    rows = rows.slice(1); // salta intestazioni
+    let articoli = rows.map((row, index) => ({
+      riga:          index + 2,
+      dataInvio:     row[0] || '',
+      titolo:        row[1] || '',
+      url:           row[2] || '',
+      fonte:         row[3] || '',
+      status:        row[4] || '',
+      testoElaborato: row[5] || ''
+    }));
+    if (status) articoli = articoli.filter(a => a.status === status);
+    res.json({ ok: true, articoli });
+  } catch (err) {
+    console.error('[/hub/articoli]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Aggiorna status e/o testo di una riga
+app.patch('/hub/articoli/:riga', async (req, res) => {
+  if (!sheetsClient || !GOOGLE_SHEET_ID)
+    return res.status(500).json({ ok: false, error: 'Sheets non configurato' });
+  const riga   = req.params.riga;
+  const { status, testo } = req.body;
+  try {
+    if (status !== undefined) {
+      await sheetsClient.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        range: `E${riga}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [[status]] }
+      });
+    }
+    if (testo !== undefined) {
+      await sheetsClient.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        range: `F${riga}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [[testo]] }
+      });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(`[/hub/articoli/${riga}]`, err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Estrai testo da URL on-demand (usato dal modal Gemini)
+app.get('/hub/estrai', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ ok: false, error: 'URL mancante' });
+  try {
+    const scraped = await estraiTestoArticolo(url);
+    if (!scraped.ok) return res.status(400).json({ ok: false, error: scraped.motivo || 'Pagina non accessibile' });
+    res.json({ ok: true, testo: scraped.testo });
+  } catch (err) {
+    console.error('[/hub/estrai]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════
 //  ENDPOINT PER GEMINI — gestione coda articoli
 // ═══════════════════════════════════════════════════════
 
