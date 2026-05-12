@@ -1,0 +1,12 @@
+{
+  "projects": {
+    "default": "newsradar-d433a"
+  },
+  "targets": {
+    "newsradar-d433a": {
+      "hosting": {
+        "hub": ["newsradar-hub"]
+      }
+    }
+  }
+}

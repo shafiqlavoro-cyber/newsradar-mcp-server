@@ -688,6 +688,29 @@ app.get('/hub/estrai', async (req, res) => {
   }
 });
 
+// Aggiunta scheda manuale dal Content Hub
+app.post('/hub/aggiungi', async (req, res) => {
+  if (!sheetsClient || !GOOGLE_SHEET_ID)
+    return res.status(500).json({ ok: false, error: 'Sheets non configurato' });
+  try {
+    const { titolo, url, fonte } = req.body;
+    if (!titolo || !url) return res.status(400).json({ ok: false, error: 'Titolo e URL obbligatori' });
+    await sheetsClient.spreadsheets.values.append({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'A:F',
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: {
+        values: [[new Date().toLocaleString('it-IT'), titolo, url, fonte || '', 'Da elaborare', '']]
+      }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[/hub/aggiungi]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════
 //  ENDPOINT PER GEMINI — gestione coda articoli
 // ═══════════════════════════════════════════════════════

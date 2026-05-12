@@ -1,434 +1,448 @@
 import { useState, useEffect } from 'react'
 import axios from 'axios'
-import { ExternalLink, Edit, CheckCircle, Copy, Search, Loader2 } from 'lucide-react'
+import { ExternalLink, Edit, CheckCircle, Copy, Search, Loader2, Plus, X, RefreshCw } from 'lucide-react'
 
-// Use the production server URL as requested
 const API_BASE = 'https://newsradar-mcp-server.onrender.com'
+const NEWSRADAR_URL = 'https://newsradar-d433a.web.app'
 
-function App() {
-  const [articoli, setArticoli] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+const REEL_PROMPT = (titolo, url, testo) => `Sei un esperto di comunicazione digitale per imprenditori.
+Leggi la notizia qui sotto e scrivi uno script per un Reel Instagram.
 
-  const [filter, setFilter] = useState('Tutti')
-  const [search, setSearch] = useState('')
+REGOLE FONDAMENTALI:
+- Scrivi SOLO il testo da dire nel video, niente didascalie o note di regia
+- Tono diretto, concreto, da imprenditore a imprenditore
+- Filtra il gergo tecnico e traducilo in impatto pratico per chi ha un'azienda
+- La domanda guida è sempre: "cosa significa concretamente per te che hai un'azienda?"
+- Durata: 30-45 secondi di parlato (circa 80-110 parole)
+- Struttura obbligatoria:
+  1. GANCIO (5 sec) — una frase che ferma lo scroll, inizia con un fatto o una domanda scomoda
+  2. CONTESTO (10 sec) — spiega il fatto in modo semplice, zero gergo
+  3. IMPATTO PRATICO (20 sec) — cosa cambia concretamente per un imprenditore italiano oggi
+  4. CHIUSURA (5 sec) — una frase ad effetto o una domanda che invita a riflettere
 
-  const [selectedArticle, setSelectedArticle] = useState(null)
-  const [isModalOpen, setIsModalOpen] = useState(false)
-  const [extractedText, setExtractedText] = useState('')
-  const [modalLoading, setModalLoading] = useState(false)
-  const [elaboratoTesto, setElaboratoTesto] = useState('')
+NOTIZIA:
+Titolo: ${titolo}
+URL: ${url}
+${testo ? `Testo estratto: ${testo}` : ''}
 
-  const [editMode, setEditMode] = useState(null)
-  const [editText, setEditText] = useState('')
+Scrivi solo lo script, senza titoli di sezione o parentesi. Testo fluido come se stessi parlando.`
 
+function Toast({ message, onClose }) {
   useEffect(() => {
-    fetchArticoli()
-  }, [])
-
-  const fetchArticoli = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const res = await axios.get(`${API_BASE}/hub/articoli`)
-      if (res.data.ok) {
-        setArticoli(res.data.articoli.reverse()) // Show newest first
-      } else {
-        setError(res.data.error || 'Errore nel caricamento articoli')
-      }
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const updateStatus = async (riga, newStatus) => {
-    // Optimistic update
-    const prevArticoli = [...articoli]
-    setArticoli(articoli.map(a => a.riga === riga ? { ...a, status: newStatus } : a))
-
-    try {
-      await axios.patch(`${API_BASE}/hub/articoli/${riga}`, { status: newStatus })
-    } catch (err) {
-      // Revert on error
-      setArticoli(prevArticoli)
-      alert('Errore nell\'aggiornamento dello status: ' + err.message)
-    }
-  }
-
-  const saveElaborato = async () => {
-    if (!selectedArticle) return
-
-    setModalLoading(true)
-    try {
-      await axios.patch(`${API_BASE}/hub/articoli/${selectedArticle.riga}`, {
-        status: 'Elaborato',
-        testo: elaboratoTesto
-      })
-
-      // Update local state
-      setArticoli(articoli.map(a =>
-        a.riga === selectedArticle.riga
-          ? { ...a, status: 'Elaborato', testoElaborato: elaboratoTesto }
-          : a
-      ))
-
-      closeModal()
-    } catch (err) {
-      alert('Errore nel salvataggio: ' + err.message)
-    } finally {
-      setModalLoading(false)
-    }
-  }
-
-  const saveEditedText = async (riga) => {
-    try {
-      await axios.patch(`${API_BASE}/hub/articoli/${riga}`, {
-        testo: editText
-      })
-
-      setArticoli(articoli.map(a =>
-        a.riga === riga ? { ...a, testoElaborato: editText } : a
-      ))
-
-      setEditMode(null)
-    } catch (err) {
-      alert('Errore nel salvataggio: ' + err.message)
-    }
-  }
-
-  const openGeminiModal = async (articolo) => {
-    setSelectedArticle(articolo)
-    setIsModalOpen(true)
-    setExtractedText('')
-    setElaboratoTesto('')
-    setModalLoading(true)
-
-    // Update status to "In lavorazione" if it's "Da elaborare"
-    if (articolo.status === 'Da elaborare') {
-      updateStatus(articolo.riga, 'In lavorazione')
-    }
-
-    try {
-      const res = await axios.get(`${API_BASE}/hub/estrai?url=${encodeURIComponent(articolo.url)}`)
-      if (res.data.ok) {
-        setExtractedText(res.data.testo)
-      } else {
-        setExtractedText('Errore estrazione: ' + res.data.error)
-      }
-    } catch (err) {
-      setExtractedText('Errore connessione per estrazione: ' + err.message)
-    } finally {
-      setModalLoading(false)
-    }
-  }
-
-  const closeModal = () => {
-    setIsModalOpen(false)
-    setSelectedArticle(null)
-    setExtractedText('')
-    setElaboratoTesto('')
-  }
-
-  const getGeminiPrompt = () => {
-    if (!selectedArticle) return ''
-
-    return `Ti passo una notizia con titolo, URL e testo estratto.
-Segui queste fasi nell'ordine.
-
-FASE 1 — Valuta il contenuto
-Leggi il testo estratto fornito. Se è insufficiente (meno di 150 parole utili),
-comunicamelo e non procedere.
-
-FASE 2 — Estrai tutto il contenuto utile
-Individua ogni informazione presente:
-- Fatti principali (chi, cosa, quando, dove, perché, come)
-- Numeri, statistiche, percentuali, date
-- Dichiarazioni di persone o istituzioni
-- Cause, conseguenze, contesto storico o geografico
-- Concetti tecnici o termini specifici
-- Eventuali sviluppi futuri menzionati
-
-FASE 3 — Scegli il tono giusto
-Scegli autonomamente tra:
-- Narrativo/storytelling — storie umane, fatti con arco narrativo
-- Tecnico/scientifico — scoperte, ricerche, tecnologia, salute
-- Urgente/allerta — crisi, emergenze, rischi imminenti
-- Leggero/curioso — notizie insolite, curiosità, cultura
-- Economico/finanziario — mercati, aziende, politiche economiche
-
-FASE 4 — Scrivi il titolo
-- Affermazione, non domanda
-- Specifico e diretto
-- Max 12 parole
-
-FASE 5 — Scrivi l'articolo
-- In italiano, linguaggio chiaro
-- Non citare mai la fonte o l'URL
-- Non copiare frasi dall'originale
-- Testo fluido in paragrafi, senza elenchi puntati o grassetti casuali
-- Struttura: apertura → sviluppo → chiusura
-
-NOTIZIA DA ELABORARE:
-Titolo: ${selectedArticle.titolo}
-URL: ${selectedArticle.url}
-Testo: ${extractedText}`
-  }
-
-  const copyPrompt = () => {
-    navigator.clipboard.writeText(getGeminiPrompt())
-    alert('Prompt copiato negli appunti!')
-  }
-
-  const copyText = (text) => {
-    navigator.clipboard.writeText(text)
-    alert('Testo copiato negli appunti!')
-  }
-
-  const getStatusBadgeClass = (status) => {
-    switch (status) {
-      case 'Da elaborare': return 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30'
-      case 'In lavorazione': return 'bg-blue-500/20 text-blue-400 border-blue-500/30'
-      case 'Elaborato': return 'bg-green-500/20 text-green-400 border-green-500/30'
-      case 'Pubblicato': return 'bg-primary/20 text-primary border-primary/30'
-      default: return 'bg-gray-500/20 text-gray-400 border-gray-500/30'
-    }
-  }
-
-  const filteredArticoli = articoli.filter(a => {
-    const matchStatus = filter === 'Tutti' || a.status === filter
-    const matchSearch = a.titolo.toLowerCase().includes(search.toLowerCase())
-    return matchStatus && matchSearch
-  })
-
+    const t = setTimeout(onClose, 2500)
+    return () => clearTimeout(t)
+  }, [onClose])
   return (
-    <div className="min-h-screen p-6 max-w-7xl mx-auto">
-      <header className="mb-8 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-        <div>
-          <h1 className="text-3xl font-bold text-white mb-2">NewsRadar Content Hub</h1>
-          <p className="text-gray-400">Pannello editoriale per elaborazione articoli</p>
-        </div>
-
-        <div className="flex flex-col sm:flex-row gap-4 w-full md:w-auto">
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={18} />
-            <input
-              type="text"
-              placeholder="Cerca per titolo..."
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              className="bg-surface border border-gray-700 rounded-lg pl-10 pr-4 py-2 text-white focus:outline-none focus:border-primary w-full"
-            />
-          </div>
-
-          <div className="flex bg-surface border border-gray-700 rounded-lg overflow-hidden">
-            {['Tutti', 'Da elaborare', 'Elaborato', 'Pubblicato'].map(f => (
-              <button
-                key={f}
-                onClick={() => setFilter(f)}
-                className={`px-4 py-2 text-sm font-medium transition-colors ${filter === f ? 'bg-primary text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}
-              >
-                {f}
-              </button>
-            ))}
-          </div>
-        </div>
-      </header>
-
-      {loading ? (
-        <div className="flex justify-center items-center h-64">
-          <Loader2 className="animate-spin text-primary" size={48} />
-        </div>
-      ) : error ? (
-        <div className="bg-red-500/10 border border-red-500/30 text-red-400 p-4 rounded-lg">
-          {error}
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {filteredArticoli.map(articolo => (
-            <div key={articolo.riga} className="bg-surface border border-gray-800 rounded-xl p-5 hover:border-gray-700 transition-colors flex flex-col">
-              <div className="flex justify-between items-start mb-3">
-                <span className={`px-2.5 py-1 text-xs font-semibold rounded-full border ${getStatusBadgeClass(articolo.status)}`}>
-                  {articolo.status}
-                </span>
-                <span className="text-xs text-gray-500">{articolo.dataInvio}</span>
-              </div>
-
-              <h3 className="text-lg font-bold text-white mb-2 leading-tight">
-                {articolo.titolo}
-              </h3>
-
-              <div className="text-sm text-gray-400 mb-4 flex items-center justify-between">
-                <span>{articolo.fonte}</span>
-                <a href={articolo.url} target="_blank" rel="noopener noreferrer" className="text-primary hover:text-primary/80 flex items-center gap-1">
-                  Originale <ExternalLink size={14} />
-                </a>
-              </div>
-
-              {articolo.testoElaborato && (
-                <div className="mt-auto mb-4 bg-gray-900/50 rounded-lg p-3 text-sm text-gray-300 border border-gray-800">
-                  {editMode === articolo.riga ? (
-                    <div className="flex flex-col gap-2">
-                      <textarea
-                        className="w-full h-32 bg-gray-800 text-white rounded p-2 focus:outline-none focus:ring-1 focus:ring-primary"
-                        value={editText}
-                        onChange={e => setEditText(e.target.value)}
-                      />
-                      <div className="flex justify-end gap-2">
-                        <button
-                          onClick={() => setEditMode(null)}
-                          className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 rounded text-white"
-                        >
-                          Annulla
-                        </button>
-                        <button
-                          onClick={() => saveEditedText(articolo.riga)}
-                          className="px-2 py-1 text-xs bg-primary hover:bg-primary/90 rounded text-white"
-                        >
-                          Salva
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="line-clamp-3 mb-2">{articolo.testoElaborato}</div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => {
-                            setEditMode(articolo.riga)
-                            setEditText(articolo.testoElaborato)
-                          }}
-                          className="text-gray-400 hover:text-white flex items-center gap-1 text-xs"
-                        >
-                          <Edit size={12} /> Modifica
-                        </button>
-                        <button
-                          onClick={() => copyText(articolo.testoElaborato)}
-                          className="text-gray-400 hover:text-white flex items-center gap-1 text-xs"
-                        >
-                          <Copy size={12} /> Copia
-                        </button>
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
-
-              <div className="mt-auto pt-4 border-t border-gray-800 flex flex-col gap-2">
-                <button
-                  onClick={() => openGeminiModal(articolo)}
-                  className="w-full py-2 bg-gray-800 hover:bg-gray-700 text-white font-medium rounded-lg transition-colors flex justify-center items-center gap-2"
-                >
-                  <img src="https://www.gstatic.com/lamda/images/favicon_v1_150160cddff7f294ce30.svg" className="w-4 h-4" alt="Gemini" />
-                  Apri con Gemini
-                </button>
-
-                {articolo.status === 'Elaborato' && (
-                  <button
-                    onClick={() => updateStatus(articolo.riga, 'Pubblicato')}
-                    className="w-full py-2 bg-primary/10 hover:bg-primary/20 text-primary font-medium rounded-lg transition-colors flex justify-center items-center gap-2"
-                  >
-                    <CheckCircle size={16} /> Segna come Pubblicato
-                  </button>
-                )}
-
-                {articolo.status === 'Pubblicato' && (
-                  <button
-                    onClick={() => updateStatus(articolo.riga, 'Elaborato')}
-                    className="w-full py-2 text-xs text-gray-500 hover:text-gray-300 font-medium transition-colors"
-                  >
-                    Annulla pubblicazione
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
-
-          {filteredArticoli.length === 0 && (
-            <div className="col-span-full py-12 text-center text-gray-500">
-              Nessun articolo trovato.
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Gemini Modal */}
-      {isModalOpen && selectedArticle && (
-        <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 overflow-y-auto">
-          <div className="bg-surface border border-gray-700 rounded-xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl">
-            <div className="p-4 border-b border-gray-800 flex justify-between items-center bg-surface sticky top-0 rounded-t-xl z-10">
-              <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                <img src="https://www.gstatic.com/lamda/images/favicon_v1_150160cddff7f294ce30.svg" className="w-5 h-5" alt="Gemini" />
-                Elaborazione con Gemini
-              </h2>
-              <button onClick={closeModal} className="text-gray-400 hover:text-white p-1">
-                ✕
-              </button>
-            </div>
-
-            <div className="p-6 overflow-y-auto flex-1 flex flex-col gap-6">
-              <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-800">
-                <h3 className="font-semibold text-gray-300 mb-2">1. Copia questo prompt precompilato</h3>
-                <div className="relative">
-                  <pre className="bg-black/50 text-gray-300 p-4 rounded text-sm overflow-x-auto whitespace-pre-wrap max-h-60">
-                    {modalLoading ? 'Estrazione testo in corso...' : getGeminiPrompt()}
-                  </pre>
-                  <button
-                    onClick={copyPrompt}
-                    disabled={modalLoading}
-                    className="absolute top-2 right-2 p-2 bg-surface hover:bg-gray-700 rounded text-gray-300 transition-colors disabled:opacity-50"
-                    title="Copia prompt"
-                  >
-                    <Copy size={16} />
-                  </button>
-                </div>
-              </div>
-
-              <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-800">
-                <h3 className="font-semibold text-gray-300 mb-2">2. Apri Gemini e incolla il prompt</h3>
-                <a
-                  href="https://gemini.google.com"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-2 px-4 py-2 bg-[#1a73e8] hover:bg-[#1557b0] text-white rounded-lg font-medium transition-colors"
-                >
-                  Apri Gemini in una nuova scheda <ExternalLink size={16} />
-                </a>
-              </div>
-
-              <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-800">
-                <h3 className="font-semibold text-gray-300 mb-2">3. Incolla qui il risultato</h3>
-                <textarea
-                  className="w-full h-48 bg-black/50 border border-gray-700 rounded-lg p-4 text-white focus:outline-none focus:border-primary resize-y"
-                  placeholder="Incolla l'articolo generato da Gemini..."
-                  value={elaboratoTesto}
-                  onChange={e => setElaboratoTesto(e.target.value)}
-                />
-              </div>
-            </div>
-
-            <div className="p-4 border-t border-gray-800 bg-surface flex justify-end gap-3 rounded-b-xl sticky bottom-0">
-              <button
-                onClick={closeModal}
-                className="px-4 py-2 text-gray-400 hover:text-white font-medium transition-colors"
-              >
-                Annulla
-              </button>
-              <button
-                onClick={saveElaborato}
-                disabled={!elaboratoTesto.trim() || modalLoading}
-                className="px-6 py-2 bg-primary hover:bg-primary/90 disabled:bg-primary/50 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-colors flex items-center gap-2"
-              >
-                {modalLoading ? <Loader2 className="animate-spin" size={18} /> : null}
-                Salva testo elaborato
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[100] bg-gray-800 border border-gray-600 text-white px-5 py-3 rounded-xl shadow-xl text-sm font-medium flex items-center gap-3">
+      <CheckCircle size={16} className="text-green-400" />
+      {message}
     </div>
   )
 }
 
-export default App
+function StatusBadge({ status }) {
+  const map = {
+    'Da elaborare':  'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
+    'In lavorazione':'bg-blue-500/20 text-blue-400 border-blue-500/30',
+    'Elaborato':     'bg-green-500/20 text-green-400 border-green-500/30',
+    'Pubblicato':    'bg-purple-500/20 text-purple-400 border-purple-500/30',
+  }
+  return (
+    <span className={`px-2.5 py-1 text-xs font-semibold rounded-full border ${map[status] || 'bg-gray-500/20 text-gray-400 border-gray-500/30'}`}>
+      {status}
+    </span>
+  )
+}
+
+export default function App() {
+  const [articoli, setArticoli]       = useState([])
+  const [loading, setLoading]         = useState(true)
+  const [error, setError]             = useState(null)
+  const [filter, setFilter]           = useState('Tutti')
+  const [search, setSearch]           = useState('')
+  const [toast, setToast]             = useState(null)
+  const [expanded, setExpanded]       = useState({})
+
+  // Modal Gemini
+  const [geminiArticle, setGeminiArticle]   = useState(null)
+  const [extractedText, setExtractedText]   = useState('')
+  const [extractLoading, setExtractLoading] = useState(false)
+  const [reelTesto, setReelTesto]           = useState('')
+  const [saving, setSaving]                 = useState(false)
+
+  // Modal modifica testo
+  const [editModal, setEditModal]   = useState(null)
+  const [editText, setEditText]     = useState('')
+
+  // Modal aggiungi scheda manuale
+  const [addModal, setAddModal]     = useState(false)
+  const [newCard, setNewCard]       = useState({ titolo: '', url: '', fonte: '' })
+  const [addLoading, setAddLoading] = useState(false)
+
+  const showToast = (msg) => setToast(msg)
+
+  useEffect(() => { fetchArticoli() }, [])
+
+  /* ── FETCH ── */
+  const fetchArticoli = async () => {
+    setLoading(true); setError(null)
+    try {
+      const res = await axios.get(`${API_BASE}/hub/articoli`)
+      if (res.data.ok) setArticoli(res.data.articoli.reverse())
+      else setError(res.data.error || 'Errore caricamento')
+    } catch (e) { setError(e.message) }
+    finally { setLoading(false) }
+  }
+
+  /* ── STATUS UPDATE ── */
+  const updateStatus = async (riga, status) => {
+    setArticoli(prev => prev.map(a => a.riga === riga ? { ...a, status } : a))
+    try { await axios.patch(`${API_BASE}/hub/articoli/${riga}`, { status }) }
+    catch (e) { showToast('Errore aggiornamento status'); fetchArticoli() }
+  }
+
+  /* ── SALVA REEL ── */
+  const saveReel = async () => {
+    if (!geminiArticle || !reelTesto.trim()) return
+    setSaving(true)
+    try {
+      await axios.patch(`${API_BASE}/hub/articoli/${geminiArticle.riga}`, {
+        status: 'Elaborato',
+        testo:  reelTesto
+      })
+      setArticoli(prev => prev.map(a =>
+        a.riga === geminiArticle.riga ? { ...a, status: 'Elaborato', testoElaborato: reelTesto } : a
+      ))
+      closeGeminiModal()
+      showToast('✅ Script Reel salvato!')
+    } catch (e) { showToast('Errore salvataggio') }
+    finally { setSaving(false) }
+  }
+
+  /* ── SALVA MODIFICA ── */
+  const saveEdit = async () => {
+    if (!editModal) return
+    try {
+      await axios.patch(`${API_BASE}/hub/articoli/${editModal.riga}`, { testo: editText })
+      setArticoli(prev => prev.map(a => a.riga === editModal.riga ? { ...a, testoElaborato: editText } : a))
+      setEditModal(null)
+      showToast('✅ Testo aggiornato!')
+    } catch (e) { showToast('Errore salvataggio') }
+  }
+
+  /* ── AGGIUNGI SCHEDA MANUALE ── */
+  const aggiungiScheda = async () => {
+    if (!newCard.titolo.trim() || !newCard.url.trim()) return
+    setAddLoading(true)
+    try {
+      await axios.post(`${API_BASE}/hub/aggiungi`, newCard)
+      setAddModal(false)
+      setNewCard({ titolo: '', url: '', fonte: '' })
+      showToast('✅ Scheda aggiunta!')
+      fetchArticoli()
+    } catch (e) { showToast('Errore aggiunta scheda') }
+    finally { setAddLoading(false) }
+  }
+
+  /* ── GEMINI MODAL ── */
+  const openGeminiModal = async (articolo) => {
+    setGeminiArticle(articolo)
+    setReelTesto('')
+    setExtractedText('')
+    if (articolo.status === 'Da elaborare') updateStatus(articolo.riga, 'In lavorazione')
+    setExtractLoading(true)
+    try {
+      const res = await axios.get(`${API_BASE}/hub/estrai?url=${encodeURIComponent(articolo.url)}`)
+      if (res.data.ok) setExtractedText(res.data.testo)
+    } catch {}
+    finally { setExtractLoading(false) }
+  }
+
+  const closeGeminiModal = () => { setGeminiArticle(null); setExtractedText(''); setReelTesto('') }
+
+  const copyPrompt = () => {
+    if (!geminiArticle) return
+    navigator.clipboard.writeText(REEL_PROMPT(geminiArticle.titolo, geminiArticle.url, extractedText))
+    showToast('📋 Prompt copiato!')
+  }
+
+  /* ── FILTERED ── */
+  const filtered = articoli.filter(a => {
+    const okStatus = filter === 'Tutti' || a.status === filter
+    const okSearch = a.titolo.toLowerCase().includes(search.toLowerCase())
+    return okStatus && okSearch
+  })
+
+  const counts = {
+    'Tutti':         articoli.length,
+    'Da elaborare':  articoli.filter(a => a.status === 'Da elaborare').length,
+    'Elaborato':     articoli.filter(a => a.status === 'Elaborato').length,
+    'Pubblicato':    articoli.filter(a => a.status === 'Pubblicato').length,
+  }
+
+  return (
+    <div className="min-h-screen" style={{ background: '#0a0c12', fontFamily: "'Inter', sans-serif" }}>
+
+      {/* ── HEADER ── */}
+      <header style={{ background: '#0d1017', borderBottom: '1px solid #1e2340' }} className="sticky top-0 z-40 px-6 py-4">
+        <div className="max-w-7xl mx-auto flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-3">
+            <div style={{ background: 'linear-gradient(135deg,#7c3aed,#a855f7)', width: 36, height: 36, borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18 }}>📡</div>
+            <div>
+              <div style={{ color: '#fff', fontWeight: 800, fontSize: '1.1rem', letterSpacing: '-0.02em' }}>NewsRadar <span style={{ color: '#7c3aed' }}>Hub</span></div>
+              <div style={{ color: '#6b7280', fontSize: '0.7rem' }}>Pannello editoriale Reel Instagram</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 flex-wrap">
+            <a href={NEWSRADAR_URL} target="_blank" rel="noopener noreferrer"
+               style={{ background: '#1e2340', border: '1px solid #2d3561', color: '#9ca3af', borderRadius: 8, padding: '6px 14px', fontSize: '0.8rem', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 6 }}>
+              ← NewsRadar <ExternalLink size={12} />
+            </a>
+            <button onClick={fetchArticoli} style={{ background: '#1e2340', border: '1px solid #2d3561', color: '#9ca3af', borderRadius: 8, padding: '6px 10px', cursor: 'pointer' }}>
+              <RefreshCw size={14} />
+            </button>
+            <button onClick={() => setAddModal(true)}
+              style={{ background: 'linear-gradient(135deg,#7c3aed,#a855f7)', border: 'none', color: '#fff', borderRadius: 8, padding: '8px 16px', fontSize: '0.85rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Plus size={16} /> Aggiungi scheda
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div className="max-w-7xl mx-auto px-6 py-6">
+
+        {/* ── TOOLBAR ── */}
+        <div className="flex flex-col sm:flex-row gap-3 mb-6">
+          <div className="relative flex-1">
+            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: '#6b7280' }} />
+            <input value={search} onChange={e => setSearch(e.target.value)}
+              placeholder="Cerca per titolo..."
+              style={{ background: '#111420', border: '1px solid #1e2340', color: '#fff', borderRadius: 8, padding: '8px 12px 8px 36px', width: '100%', outline: 'none', fontSize: '0.875rem' }} />
+          </div>
+          <div style={{ display: 'flex', background: '#111420', border: '1px solid #1e2340', borderRadius: 8, overflow: 'hidden' }}>
+            {Object.entries(counts).map(([f, n]) => (
+              <button key={f} onClick={() => setFilter(f)}
+                style={{ padding: '8px 14px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', border: 'none', transition: 'all 0.15s',
+                  background: filter === f ? '#7c3aed' : 'transparent',
+                  color: filter === f ? '#fff' : '#9ca3af' }}>
+                {f} <span style={{ opacity: 0.7, fontSize: '0.7rem' }}>({n})</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* ── CONTENT ── */}
+        {loading ? (
+          <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: 300 }}>
+            <Loader2 className="animate-spin" size={40} style={{ color: '#7c3aed' }} />
+          </div>
+        ) : error ? (
+          <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#f87171', padding: 16, borderRadius: 10 }}>{error}</div>
+        ) : (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 20 }}>
+            {filtered.map(a => (
+              <Card key={a.riga} articolo={a}
+                expanded={expanded[a.riga]}
+                onExpand={() => setExpanded(p => ({ ...p, [a.riga]: !p[a.riga] }))}
+                onGemini={() => openGeminiModal(a)}
+                onPubblica={() => updateStatus(a.riga, 'Pubblicato')}
+                onAnnulla={() => updateStatus(a.riga, 'Elaborato')}
+                onEdit={() => { setEditModal(a); setEditText(a.testoElaborato || '') }}
+                onCopy={() => { navigator.clipboard.writeText(a.testoElaborato || ''); showToast('📋 Copiato!') }}
+              />
+            ))}
+            {filtered.length === 0 && (
+              <div style={{ gridColumn: '1/-1', textAlign: 'center', color: '#6b7280', padding: 60 }}>
+                Nessuna scheda trovata.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── MODAL GEMINI ── */}
+      {geminiArticle && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, zIndex: 50, overflowY: 'auto' }}>
+          <div style={{ background: '#111420', border: '1px solid #2d3561', borderRadius: 16, width: '100%', maxWidth: 760, maxHeight: '90vh', display: 'flex', flexDirection: 'column', boxShadow: '0 25px 60px rgba(0,0,0,0.6)' }}>
+            {/* header */}
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid #1e2340', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ background: 'linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045)', borderRadius: 8, width: 30, height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16 }}>
+                📸
+                </div>
+                <div>
+                  <div style={{ color: '#fff', fontWeight: 700, fontSize: '0.95rem' }}>Script Reel Instagram</div>
+                  <div style={{ color: '#6b7280', fontSize: '0.72rem' }}>{geminiArticle.titolo}</div>
+                </div>
+              </div>
+              <button onClick={closeGeminiModal} style={{ background: 'none', border: 'none', color: '#6b7280', cursor: 'pointer', padding: 4 }}><X size={20} /></button>
+            </div>
+
+            <div style={{ padding: 20, overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {/* Step 1 — prompt */}
+              <div style={{ background: '#0d1017', border: '1px solid #1e2340', borderRadius: 10, padding: 14 }}>
+                <div style={{ color: '#9ca3af', fontSize: '0.8rem', fontWeight: 600, marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span>① Copia il prompt per Gemini</span>
+                  {extractLoading && <Loader2 size={14} className="animate-spin" style={{ color: '#7c3aed' }} />}
+                </div>
+                <pre style={{ color: '#d1d5db', fontSize: '0.75rem', whiteSpace: 'pre-wrap', maxHeight: 180, overflowY: 'auto', lineHeight: 1.5 }}>
+                  {extractLoading ? 'Estrazione testo in corso...' : REEL_PROMPT(geminiArticle.titolo, geminiArticle.url, extractedText)}
+                </pre>
+                <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                  <button onClick={copyPrompt} disabled={extractLoading}
+                    style={{ background: '#7c3aed', border: 'none', color: '#fff', borderRadius: 7, padding: '7px 16px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <Copy size={13} /> Copia prompt
+                  </button>
+                  <a href="https://gemini.google.com" target="_blank" rel="noopener noreferrer"
+                    style={{ background: '#1a73e8', color: '#fff', borderRadius: 7, padding: '7px 16px', fontSize: '0.8rem', fontWeight: 600, textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 6 }}>
+                    Apri Gemini <ExternalLink size={13} />
+                  </a>
+                </div>
+              </div>
+
+              {/* Step 2 — incolla risultato */}
+              <div style={{ background: '#0d1017', border: '1px solid #1e2340', borderRadius: 10, padding: 14 }}>
+                <div style={{ color: '#9ca3af', fontSize: '0.8rem', fontWeight: 600, marginBottom: 8 }}>② Incolla lo script generato da Gemini</div>
+                <textarea value={reelTesto} onChange={e => setReelTesto(e.target.value)}
+                  placeholder="Incolla qui lo script del Reel..."
+                  style={{ width: '100%', minHeight: 160, background: '#111420', border: '1px solid #2d3561', color: '#fff', borderRadius: 8, padding: 12, fontSize: '0.85rem', outline: 'none', resize: 'vertical', lineHeight: 1.6, boxSizing: 'border-box' }} />
+              </div>
+            </div>
+
+            <div style={{ padding: '14px 20px', borderTop: '1px solid #1e2340', display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button onClick={closeGeminiModal} style={{ background: 'none', border: 'none', color: '#9ca3af', cursor: 'pointer', padding: '8px 14px', fontSize: '0.85rem' }}>Annulla</button>
+              <button onClick={saveReel} disabled={!reelTesto.trim() || saving}
+                style={{ background: reelTesto.trim() ? 'linear-gradient(135deg,#7c3aed,#a855f7)' : '#2d3561', border: 'none', color: '#fff', borderRadius: 8, padding: '8px 20px', fontSize: '0.85rem', fontWeight: 600, cursor: reelTesto.trim() ? 'pointer' : 'not-allowed', display: 'flex', alignItems: 'center', gap: 7 }}>
+                {saving ? <Loader2 size={15} className="animate-spin" /> : <CheckCircle size={15} />}
+                Salva script
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── MODAL MODIFICA ── */}
+      {editModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, zIndex: 50 }}>
+          <div style={{ background: '#111420', border: '1px solid #2d3561', borderRadius: 16, width: '100%', maxWidth: 640, display: 'flex', flexDirection: 'column', boxShadow: '0 25px 60px rgba(0,0,0,0.6)' }}>
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid #1e2340', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span style={{ color: '#fff', fontWeight: 700 }}>Modifica script</span>
+              <button onClick={() => setEditModal(null)} style={{ background: 'none', border: 'none', color: '#6b7280', cursor: 'pointer' }}><X size={20} /></button>
+            </div>
+            <div style={{ padding: 20 }}>
+              <textarea value={editText} onChange={e => setEditText(e.target.value)}
+                style={{ width: '100%', minHeight: 240, background: '#0d1017', border: '1px solid #2d3561', color: '#fff', borderRadius: 8, padding: 12, fontSize: '0.85rem', outline: 'none', resize: 'vertical', lineHeight: 1.6, boxSizing: 'border-box' }} />
+            </div>
+            <div style={{ padding: '14px 20px', borderTop: '1px solid #1e2340', display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button onClick={() => setEditModal(null)} style={{ background: 'none', border: 'none', color: '#9ca3af', cursor: 'pointer', padding: '8px 14px' }}>Annulla</button>
+              <button onClick={saveEdit} style={{ background: 'linear-gradient(135deg,#7c3aed,#a855f7)', border: 'none', color: '#fff', borderRadius: 8, padding: '8px 20px', fontSize: '0.85rem', fontWeight: 600, cursor: 'pointer' }}>Salva</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── MODAL AGGIUNGI ── */}
+      {addModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, zIndex: 50 }}>
+          <div style={{ background: '#111420', border: '1px solid #2d3561', borderRadius: 16, width: '100%', maxWidth: 480, boxShadow: '0 25px 60px rgba(0,0,0,0.6)' }}>
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid #1e2340', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span style={{ color: '#fff', fontWeight: 700 }}>Aggiungi scheda manualmente</span>
+              <button onClick={() => setAddModal(false)} style={{ background: 'none', border: 'none', color: '#6b7280', cursor: 'pointer' }}><X size={20} /></button>
+            </div>
+            <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
+              {[['Titolo *', 'titolo', 'Titolo dell\'articolo o contenuto...'], ['URL *', 'url', 'https://...'], ['Fonte', 'fonte', 'Es: Wired, TechCrunch, HackerNews...']].map(([label, key, ph]) => (
+                <div key={key}>
+                  <label style={{ color: '#9ca3af', fontSize: '0.78rem', fontWeight: 600, display: 'block', marginBottom: 6 }}>{label}</label>
+                  <input value={newCard[key]} onChange={e => setNewCard(p => ({ ...p, [key]: e.target.value }))}
+                    placeholder={ph}
+                    style={{ width: '100%', background: '#0d1017', border: '1px solid #2d3561', color: '#fff', borderRadius: 8, padding: '9px 12px', fontSize: '0.85rem', outline: 'none', boxSizing: 'border-box' }} />
+                </div>
+              ))}
+            </div>
+            <div style={{ padding: '14px 20px', borderTop: '1px solid #1e2340', display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button onClick={() => setAddModal(false)} style={{ background: 'none', border: 'none', color: '#9ca3af', cursor: 'pointer', padding: '8px 14px' }}>Annulla</button>
+              <button onClick={aggiungiScheda} disabled={!newCard.titolo.trim() || !newCard.url.trim() || addLoading}
+                style={{ background: newCard.titolo && newCard.url ? 'linear-gradient(135deg,#7c3aed,#a855f7)' : '#2d3561', border: 'none', color: '#fff', borderRadius: 8, padding: '8px 20px', fontSize: '0.85rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 7 }}>
+                {addLoading ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
+                Aggiungi
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && <Toast message={toast} onClose={() => setToast(null)} />}
+    </div>
+  )
+}
+
+function Card({ articolo: a, expanded, onExpand, onGemini, onPubblica, onAnnulla, onEdit, onCopy }) {
+  return (
+    <div style={{ background: '#111420', border: '1px solid #1e2340', borderRadius: 14, padding: 18, display: 'flex', flexDirection: 'column', gap: 10, transition: 'border-color 0.15s' }}
+      onMouseEnter={e => e.currentTarget.style.borderColor = '#2d3561'}
+      onMouseLeave={e => e.currentTarget.style.borderColor = '#1e2340'}>
+
+      {/* top row */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <StatusBadge status={a.status} />
+        <span style={{ color: '#4b5563', fontSize: '0.68rem' }}>{a.dataInvio}</span>
+      </div>
+
+      {/* title */}
+      <div style={{ color: '#fff', fontWeight: 700, fontSize: '0.95rem', lineHeight: 1.4 }}>{a.titolo}</div>
+
+      {/* meta */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{ color: '#6b7280', fontSize: '0.78rem' }}>{a.fonte}</span>
+        {a.url && (
+          <a href={a.url} target="_blank" rel="noopener noreferrer"
+            style={{ color: '#7c3aed', fontSize: '0.78rem', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 4 }}>
+            Articolo <ExternalLink size={12} />
+          </a>
+        )}
+      </div>
+
+      {/* testo elaborato */}
+      {a.testoElaborato && (
+        <div style={{ background: '#0d1017', border: '1px solid #1e2340', borderRadius: 8, padding: 10 }}>
+          <div style={{ color: '#d1d5db', fontSize: '0.8rem', lineHeight: 1.6, overflow: 'hidden', maxHeight: expanded ? 'none' : 72, transition: 'max-height 0.3s' }}>
+            {a.testoElaborato}
+          </div>
+          {a.testoElaborato.length > 200 && (
+            <button onClick={onExpand} style={{ color: '#7c3aed', fontSize: '0.75rem', background: 'none', border: 'none', cursor: 'pointer', marginTop: 4, padding: 0 }}>
+              {expanded ? 'Mostra meno ↑' : 'Leggi tutto ↓'}
+            </button>
+          )}
+          <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
+            <button onClick={onEdit} style={{ color: '#9ca3af', fontSize: '0.75rem', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Edit size={12} /> Modifica
+            </button>
+            <button onClick={onCopy} style={{ color: '#9ca3af', fontSize: '0.75rem', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Copy size={12} /> Copia
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* actions */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 'auto', paddingTop: 10, borderTop: '1px solid #1e2340' }}>
+        <button onClick={onGemini}
+          style={{ background: 'linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045)', border: 'none', color: '#fff', borderRadius: 8, padding: '9px 0', fontWeight: 700, fontSize: '0.82rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7 }}>
+          📸 Script Reel con Gemini
+        </button>
+        {a.status === 'Elaborato' && (
+          <button onClick={onPubblica}
+            style={{ background: 'rgba(124,58,237,0.12)', border: '1px solid rgba(124,58,237,0.3)', color: '#a78bfa', borderRadius: 8, padding: '7px 0', fontWeight: 600, fontSize: '0.82rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+            <CheckCircle size={14} /> Segna come Pubblicato
+          </button>
+        )}
+        {a.status === 'Pubblicato' && (
+          <button onClick={onAnnulla}
+            style={{ background: 'none', border: 'none', color: '#4b5563', fontSize: '0.75rem', cursor: 'pointer' }}>
+            Annulla pubblicazione
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
