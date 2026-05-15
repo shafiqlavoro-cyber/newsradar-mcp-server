@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import axios from 'axios'
+import { auth, googleProvider, caricaDatiUtente, salvaDatiUtente, onAuthStateChanged, signInWithPopup, signOut } from './firebase.js'
 import { ExternalLink, Edit, CheckCircle, Copy, Search, Loader2, Plus, X, RefreshCw, Trash2 } from 'lucide-react'
 
 const API_BASE = 'https://newsradar-mcp-server.onrender.com'
@@ -82,6 +83,27 @@ export default function App() {
   const [search, setSearch]         = useState('')
   const [toast, setToast]           = useState(null)
   const [expanded, setExpanded]     = useState({})
+  // AUTH
+  const [user, setUser] = useState(null)
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      setUser(u)
+      if (u) {
+        const dati = await caricaDatiUtente(u.uid)
+        if (dati && dati.hub_prompts) {
+          setPrompts(prev => Object.fromEntries(Object.keys(prev).map(k => [k, { ...prev[k], testo: dati.hub_prompts[k] || prev[k].testo }])))
+        }
+      }
+    })
+    return () => unsub()
+  }, [])
+  const loginGoogle = async () => { try { await signInWithPopup(auth, googleProvider) } catch (e) { console.error(e) } }
+  const logoutUser = async () => { try { await signOut(auth) } catch {} }
+  const syncPromptsFirestore = async (np) => {
+    savePrompts(np)
+    if (user) await salvaDatiUtente(user.uid, { hub_prompts: Object.fromEntries(Object.keys(np).map(k => [k, np[k].testo])) })
+  }
+
 
   // Modal Gemini
   const [geminiArticle, setGeminiArticle]   = useState(null)

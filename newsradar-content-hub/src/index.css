@@ -1,17 +1,73 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
 @import "tailwindcss";
 
 @theme {
-  --color-background: #0a0c12;
-  --color-surface: #111420;
-  --color-primary: #7c3aed;
-  --font-sans: 'Inter', sans-serif;
+  --color-background: #07080f;
+  --color-surface: #0f1220;
+  --color-primary: #5b7cf6;
+  --font-sans: 'DM Sans', sans-serif;
 }
 
 @layer base {
-  body {
-    background-color: var(--color-background);
-    color: #e5e7eb; /* text-gray-200 equivalent */
+  html, body {
+    background-color: #07080f;
+    color: #eef0f8;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    font-family: 'DM Sans', sans-serif;
+    /* blocca lo swipe/overflow orizzontale */
+    overflow-x: hidden;
+    max-width: 100vw;
+  }
+
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+}
+
+/* ── MOBILE HUB < 768px ── */
+@media (max-width: 768px) {
+
+  /* Blocco assoluto overflow laterale */
+  body { overflow-x: hidden !important; }
+  #root, #root > div { overflow-x: hidden !important; max-width: 100vw !important; }
+
+  /* Header compatto: solo logo + refresh */
+  header[style*="position: sticky"],
+  header[style*="position:sticky"] {
+    padding: 0 12px !important;
+    height: 50px !important;
+  }
+
+  /* Nascondi pulsanti secondari nell'header su mobile */
+  header a[style*="newsradar-d433a"] { display: none !important; }
+
+  /* Grid 1 colonna */
+  div[style*="auto-fill"] {
+    grid-template-columns: 1fr !important;
+    gap: 10px !important;
+  }
+
+  /* Padding laterale ridotto */
+  div[style*="maxWidth: 1200"],
+  div[style*="max-width: 1200"] {
+    padding: 12px !important;
+  }
+
+  /* Modal → bottom sheet */
+  div[style*="align-items: center"][style*="justify-content: center"][style*="position: fixed"] {
+    align-items: flex-end !important;
+  }
+  /* Contenuto modal */
+  div[style*="maxWidth: 720"],
+  div[style*="maxWidth: 760"],
+  div[style*="maxWidth: 640"],
+  div[style*="maxWidth: 460"] {
+    border-radius: 16px 16px 0 0 !important;
+    max-height: 92vh !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
   }
 }
